@@ -1,6 +1,28 @@
 # make-it-right
 
-Don't look at me I am a messy work in progress
+Don't look at me I am a messy work in progress.
+
+### TODO
+
+- [ ] Remaining tags definition (thumbnail)
+- [ ] Detection of unhandled tags
+- [ ] Tag write
+- [ ] Serialize
+- [ ] Write in place into JPEG (zero previous, write over (must have enough space)
+- [ ] Write into JPEG (parse JIF, omit existing, insert)
+- [ ] Remove from JPEG
+- [ ] Pluto integration
+
+### TODO but only if im given unhealthy amount of coffe
+
+- [ ] Maker Note
+
+### TODO but probablt wont
+
+- [ ] Parse from TIFF (who care)
+- [ ] Parse from PNG (barely standard)
+- [ ] Parse from HEIC (what is this)
+- [ ] Write into and pluto integration for all those file format
 
 ## Installation
 
