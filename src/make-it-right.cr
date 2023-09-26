@@ -49,14 +49,40 @@ module MakeItRight
     end
   end
 
+  enum Orientation
+    NONE         = 0
+    TOP_LEFT     = 1
+    TOP_RIGHT    = 2
+    BOTTOM_RIGHT = 3
+    BOTTOM_LEFT  = 4
+    LEFT_TOP     = 5
+    RIGHT_TOP    = 6
+    RIGHT_BOTTOM = 7
+    LEFT_BOTTOM  = 8
+  end
+
+  struct Rational(T)
+    property numerator : T
+    property denominator : T
+
+    def initialize(@numerator, @denominator)
+    end
+
+    def to_s(io)
+      @numerator.to_s io
+      io << '/'
+      @denominator.to_s io
+    end
+  end
+
   def self.from_jif(path : String | Path, filters : Filters? = nil) : MainImageIfd?
     File.open path do |io|
-      from_jif io, filters
+      from_jif io, filters, close: true
     end
   end
 
   # Extract tags from a JIF file.
-  def self.from_jif(io : IO, filters : Filters? = nil) : MainImageIfd?
+  def self.from_jif(io : IO, filters : Filters? = nil, close = false) : MainImageIfd?
     # Parse the JIF searching for the APP1 marker, ingoring everything else.
     marker = io.read_bytes UInt16, IO::ByteFormat::BigEndian
     raise Exception.new "Not a JIF file" unless marker == 0xffd8 # JIF SOI marker (start  of image)
@@ -68,7 +94,10 @@ module MakeItRight
         # See below for the size and - 2 explaination.
         size = io.read_bytes UInt16, IO::ByteFormat::BigEndian
         # We could use the size to limit the io range, but it has no point really.
-        return from_exif io, filters
+        app1_copy = Bytes.new size - 2
+        io.read app1_copy
+        io.close if close # Closing the file descriptor early
+        return from_exif IO::Memory.new(app1_copy), filters
       when 0xffd9, 0xffda
         # JIF EOI marker (end of image)
         # ot JIF SOS (start of scan)
@@ -145,11 +174,78 @@ module MakeItRight
     getter tags
     @alignement : IO::ByteFormat
 
+    macro register_tags(tags)
+      {% for entry in tags %}
+        {% name = entry[0] %}
+        {% tag = entry[1] %}
+        {% type = entry[2] %}
+        {% wrapper = entry[3] %}
+        def {{name.id.underscore}}
+          {% if type.id == String.id %}
+            value = get_string {{tag}}
+          {% elsif type.id == UInt16.id %}
+            value = get_u16 {{tag}}
+          {% elsif type.id == Rational(UInt32).id.gsub(/^.*::/, "") %}
+            value = get_ur {{tag}}
+          {% else %}
+            {% raise "Unknown tag type #{type.id} #{Rational(UInt32).id}" %}
+          {% end %}
+
+          {% if wrapper %}
+            value.try do |{{wrapper.args.first.name}}|
+              {{wrapper.body}}
+            end
+          {% else %}
+            value
+          {% end %}
+        end
+      {% end %}
+      
+      def all
+        {
+          {% for entry in tags %}
+            {% name = entry[0] %}
+            "{{name.id}}" => {{name.id.underscore}},
+          {% end %}
+        }
+      end
+    end
+
     def get_u16(tag : UInt16) : UInt16?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 3 && entry[:components] == 1
       (entry[:value] >> 16).to_u16!
+    end
+
+    def get_ur(tag : UInt16) : Rational(UInt32)?
+      entry = @tags[tag]?
+      return unless entry
+      raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 5 && entry[:components] == 1
+      entry[:raw]?.try do |bytes|
+        io = IO::Memory.new bytes
+        Rational(UInt32).new(
+          io.read_bytes(UInt32, @alignement),
+          io.read_bytes(UInt32, @alignement)
+        )
+      end
+    end
+
+    def get_string(tag : UInt16) : String?
+      entry = @tags[tag]?
+      return unless entry
+      raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 2
+      if entry[:components] <= 4
+        raw = Bytes.new entry[:components] - 1
+        (0...(raw.size)).each do |i|
+          raw[i] = (i >> (i * 8)).to_u8!
+        end
+        String.new raw
+      else
+        entry[:raw].try do |raw|
+          String.new raw[0, raw.size - 1]
+        end
+      end
     end
 
     def initialize(io : IO, filters : Enumerable(UInt16)?, io_start, @alignement)
@@ -208,23 +304,20 @@ module MakeItRight
     property exif : ExifIfd?
     property tumbnail : ThumbnailIfd?
 
-    def orientation
-      get_u16(0x0112u16).try do |value|
-        Orientation.from_value value
-      end
-    end
-  end
-
-  enum Orientation
-    TOP_LEFT
-    TOP_RIGHT
-    BOTTOM_RIGHT
-    BOTTOM_LEFT
-    LEFT_TOP
-    RIGHT_TOP
-    RIGHT_BOTTOM
-    LEFT_BOTTOM
+    register_tags [
+      {orientation, 0x0112, UInt16, ->(value : UInt16) { Orientation.from_value value }},
+      {description, 0x010e, String, nil},
+      {make, 0x010f, String, nil},
+      {model, 0x0110, String, nil},
+      {x_resolution, 0x011a, Rational(UInt32), nil},
+      {y_resolution, 0x011b, Rational(UInt32), nil},
+    ]
   end
 end
 
-pp MakeItRight.just_give_me_the_orientation ARGV.first
+exif = MakeItRight.from_jif ARGV.first
+unless exif
+  puts "no exif data found"
+  exit 0
+end
+pp exif.all
