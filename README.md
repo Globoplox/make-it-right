@@ -4,8 +4,6 @@ Don't look at me I am a messy work in progress.
 
 ### TODO
 
-- [ ] Remaining tags definition (thumbnail)
-- [ ] Detection of unhandled tags
 - [ ] Tag write
 - [ ] Serialize
 - [ ] Write in place into JPEG (zero previous, write over (must have enough space)
@@ -17,7 +15,7 @@ Don't look at me I am a messy work in progress.
 
 - [ ] Maker Note
 
-### TODO but probablt wont
+### TODO but probably wont
 
 - [ ] Parse from TIFF (who care)
 - [ ] Parse from PNG (barely standard)

@@ -31,6 +31,23 @@ module MakeItRight
   class Exception < ::Exception
   end
 
+  class InterpretException < Exception
+    def initialize(@cause : ::Exception, @tag : UInt16, @format : UInt16, @components : UInt32, @value : UInt32, @raw : Bytes?)
+      super cause: @cause
+    end
+
+    def message
+      <<-STR
+      Could not interpet tag 0x#{@tag.to_s 16} 
+        format: #{@format} 
+        components: #{@components}
+        value: 0x#{@value.to_s 16}
+        raw_data: #{@raw.try { |raw| "0x#{raw.map(&.to_s 16).join}" } || "none"}
+
+      STR
+    end
+  end
+
   class Filters
     property tags : Enumerable(UInt16)?
     property subs : Hash(Symbol, Filters)?
@@ -116,15 +133,47 @@ module MakeItRight
   end
 
   struct Flash
-    def self.from_value(value : UInt16)
-      new(value & 0b1 != 0, value & 0b10 != 0, value & 0b100 != 0)
+    enum Fired
+      FIRED     = 0b0
+      NOT_FIRED = 0b1
     end
 
-    property fired : Bool
-    property detectable : Bool
-    property detected : Bool
+    enum Strobe
+      NO_STROBE_DETECTION_FEATURE = 0b00
+      RESERVED                    = 0b01
+      NOT_DETECTED                = 0b10
+      DETECTED                    = 0b11
+    end
 
-    def initialize(@fired, @detected, @detectable)
+    enum Mode
+      UNKNOWN                       = 0b00
+      COMPULSTORY_FLASH_FIRING      = 0b01
+      COMPULSTORY_FLASH_SUPPRESSION = 0b10
+      AUTO                          = 0b11
+    end
+
+    enum FlashFunctionality
+      PRESENT = 0b0
+      ABSENT  = 0b1
+    end
+
+    enum RedEyeReduction
+      PRESENT = 0b0
+      ABSENT  = 0b1
+    end
+
+    property fired : Fired
+    property strobe : Strobe
+    property mode : Mode
+    property functionality : FlashFunctionality
+    property red_eye : RedEyeReduction
+
+    def initialize(value)
+      @fired = Fired.from_value value & 0b1
+      @strobe = Strobe.from_value value >> 1 & 0b11
+      @mode = Mode.from_value value >> 3 & 0b11
+      @functionality = FlashFunctionality.from_value value >> 5 & 0b1
+      @red_eye = RedEyeReduction.from_value value >> 6 & 0b1
     end
   end
 
@@ -135,8 +184,14 @@ module MakeItRight
   end
 
   enum SensingMethod
-    UNKNOWN = 0
-    REGULAR = 1
+    INVALID                 = 0
+    UNDEFINED               = 1
+    ONE_CHIP_COLOR_AREA     = 2
+    TWO_CHIP_COLOR_AREA     = 3
+    THREE_CHIP_COLOR_AREA   = 4
+    COLOR_SEQUENTIAL_AREA   = 5
+    TRILINEAR               = 7
+    COLOR_SEQUENTIAL_LINEAR = 8
   end
 
   enum Compression
@@ -150,6 +205,57 @@ module MakeItRight
     MONOCHROME = 1
     RGB        = 2
     YCBCR      = 6
+  end
+
+  enum ExposureMode
+    AUTO_EXPOSURE   = 0
+    MANUAL_EXPOSURE = 1
+    AUTO_BRACKET    = 2
+  end
+
+  enum WhiteBalance
+    AUTO   = 0
+    MANUAL = 1
+  end
+
+  enum SceneType
+    STANDARD  = 0
+    LANDSCAPE = 1
+    PORTRAIT  = 2
+    NIGHT     = 3
+  end
+
+  enum GainControl
+    NONE           = 0
+    LOW_GAIN_UP    = 1
+    HIGH_GAIN_UP   = 2
+    LOW_GAIN_DOWN  = 3
+    HIGH_GAIN_DOWN = 4
+  end
+
+  enum Contrast
+    NORMAL = 0
+    SOFT   = 1
+    HARD   = 2
+  end
+
+  enum Saturation
+    NORMAL = 0
+    LOW    = 1
+    HIGH   = 2
+  end
+
+  enum Sharpness
+    NORMAL = 0
+    SOFT   = 1
+    HARD   = 2
+  end
+
+  enum DistanceRange
+    UNKNOWN = 0
+    MACRO   = 1
+    CLOSE   = 2
+    DISTANT = 3
   end
 
   struct Rational(T)
@@ -308,6 +414,7 @@ module MakeItRight
     getter offset : UInt32
     getter tags
     @alignement : IO::ByteFormat
+    @errors = [] of ::Exception
 
     macro register_tags(tags)
       {% for entry in tags %}
@@ -315,9 +422,7 @@ module MakeItRight
         {% tag = entry[1] %}
         {% type = entry[2] %}
         {% if type.id == "self".id %}
-        # TODO: make this generic
-        {% elsif type.id == "UInt16 | UInt32" %}
-          {% type = Union(UInt16, UInt32) %}
+        {% elsif type.id.includes? '|' %}
         {% else %}
           {% type = type.resolve %}
         {% end %}
@@ -325,8 +430,8 @@ module MakeItRight
         def {{name.id.underscore}}
           {% if type.id == "self".id %}
             value = self
-          {% elsif type.union? %}
-            value = get_union {{tag}}, {{type}}
+          {% elsif type.id.includes? '|' %}
+            value = get_union {{tag}}, Union({{type}})
           {% elsif type < Enum %}
             value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
           {% elsif type.id == Array(UInt16 | UInt32).id %}
@@ -362,6 +467,18 @@ module MakeItRight
           {% else %}
             value
           {% end %}
+        rescue ex
+          entry = tags[{{tag}}]?
+          ex = InterpretException.new(
+            tag: {{tag}}.to_u16, 
+            value: entry[:value],
+            raw: entry[:raw],
+            format: entry[:format],
+            components: entry[:components],
+            cause: ex
+          ) if entry
+          @errors << ex
+          nil
         end
       {% end %}
       
@@ -381,16 +498,23 @@ module MakeItRight
       end
     end
 
-    # Support only UInt16 and UInt32 as they are the necessary ones
+    def errors
+      @errors
+    end
+
+    # Support UInt16, UInt32, Array(UInt16) as they are the necessary ones
     # but it can be easely extended
     def get_union(tag : UInt16, union_type : T.class) forall T
       entry = @tags[tag]?
       return unless entry
-      case entry[:format]
-      when 3
+      case {entry[:format], entry[:components]}
+      when {3, 1}
         type = UInt16
         value = get_u16 tag
-      when 4
+      when {3, _}
+        type = Array(UInt16)
+        value = get_au16 tag
+      when {4, 1}
         type = UInt32
         value = get_u32 tag
       else raise Exception.new "This tag is not registered as a type solvable in union"
@@ -591,8 +715,12 @@ module MakeItRight
       {related_image_height, 0x1002, UInt16 | UInt32, nil},
     ]
 
+    def all_errors
+      errors
+    end
+
     def all_unknown
-      {"tags" => unknown_tags}
+      unknown_tags unless unknown_tags.empty?
     end
   end
 
@@ -600,11 +728,18 @@ module MakeItRight
     property interoperability : InteroperabilityIfd?
     property maker_note : MakerNoteIfd?
 
+    def all_errors
+      @errors +
+        (maker_note.try(&.all_errors) || [] of Exception) +
+        (interoperability.try(&.all_errors) || [] of Exception)
+    end
+
     register_tags [
       {exposure_time, 0x829a, Rational(UInt32), nil},
       {f_number, 0x829d, Rational(UInt32), nil},
       {exposure_program, 0x8822, ExposureProgram, nil},
-      {iso_speef_ratings, 0x8827, Array(UInt16), nil},
+      {iso_speed_ratings, 0x8827, Array(UInt16), nil},
+      {oecf, 0x8828, Bytes, nil},                                            # Could be parsed
       {exif_version, 0x9000, Bytes, ->(value : Bytes) { String.new value }}, # not String because it has no null terminator
       {date_time_original, 0x9003, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
       {date_time_digitized, 0x9004, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
@@ -618,18 +753,19 @@ module MakeItRight
       {subject_distance, 0x9206, Rational(Int32), nil}, # meter. maybe add optional unit to rational ?
       {metering_mode, 0x9207, MeteringMode, nil},
       {light_source, 0x9208, LightSource, nil},
-      {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.from_value value }},
+      {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.new value }},
       {focal_length, 0x920a, Rational(UInt32), nil},
       {maker_note_offset, 0x927c, self, ->(value : self) { value.maker_note.try(&.all) }},
       {user_comment, 0x9286, Bytes, ->(value : Bytes) { UserComment.from_value value }},
-      {subsec_time, 0x9290, String, ->(v : String) { v.to_i.milliseconds }},
-      {subsec_time_original, 0x9291, String, ->(v : String) { v.to_i.milliseconds }},
-      {subsec_time_digitized, 0x9292, String, ->(v : String) { v.to_i.milliseconds }},
+      {subsec_time, 0x9290, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
+      {subsec_time_original, 0x9291, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
+      {subsec_time_digitized, 0x9292, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
       {flash_pix_version, 0xa000, Bytes, ->(value : Bytes) { String.new value }}, # No null terminator
       {color_space, 0xa001, ColorSpace, nil},
-      {exif_image_width, 0xa002, UInt16 | UInt32, nil},
-      {exif_image_height, 0xa003, UInt16 | UInt32, nil},
+      {exif_image_width, 0xa002, UInt16 | UInt32 | Array(UInt16), nil},
+      {exif_image_height, 0xa003, UInt16 | UInt32 | Array(UInt16), nil},
       {related_sound_file, 0xa004, String, nil},
+      {flash_energy, 0xa20b, Rational(Int32), nil},
       {interoperability_offset, 0xa005, self, ->(value : self) { value.interoperability.try(&.all) }},
       {focal_plane_x_resolution, 0xa20e, Rational(UInt32), nil},
       {focal_plane_y_resolution, 0xa20f, Rational(UInt32), nil},
@@ -639,19 +775,54 @@ module MakeItRight
       {file_source, 0xa300, Bytes, nil},
       {scene_type, 0xa301, Bytes, nil},
       {cfa_pattern, 0xa302, Bytes, nil},
+      {custom_rendered, 0xa401, UInt16, ->(value : UInt16) { value != 0 }},
+      {exposure_mode, 0xa402, ExposureMode, nil},
+      {white_balance, 0xa403, WhiteBalance, nil},
+      {digital_zoom_ratio, 0xa404, Rational(UInt32), nil},
+      {focal_length_in_35mm_film, 0xa405, UInt16, nil},
+      {scene_capture_type, 0xa406, SceneType, nil},
+      {gain_control, 0xa407, GainControl, nil},
+      {contrast, 0xa408, Contrast, nil},
+      {saturation, 0xa409, Saturation, nil},
+      {sharpness, 0xa40a, Sharpness, nil},
+      {device_setting_description, 0xa40b, Bytes, nil},
+      {subject_distance_range, 0xa40c, DistanceRange, nil},
+      {image_uid, 0xa420, String, nil},
+      {subject_area, 0x9214, Array(UInt16), nil},
+      {sensitivity_type, 0x8830, UInt16, nil}, # I dont know how to interpret it
+      {camera_owner_name, 0xa430, String, nil},
+      {lens_specifications, 0xa432, Array(Rational(UInt32)), nil},
+      {lens_make, 0xa433, String, nil},
+      {lens_model, 0xa434, String, nil},
+      {lens_serial_number, 0xa435, String, nil},
+      {offset_time, 0x9010, String, nil},
+      {offset_time_original, 0x9011, String, nil},
+      {offset_time_digitized, 0x9012, String, nil},
+      {body_serial_number, 0xa431, String, nil},
+      # That one is fun, it's an attempt by microsoft to fix maker note that ended being another
+      # issue on its own. It probably make no sense.
+      {offset_schema, 0xea1d, UInt32, nil},
     ]
 
     def all_unknown
+      u_tags = unknown_tags.empty? ? nil : unknown_tags
+      u_interoperability = interoperability.try &.all_unknown
+      u_maker_note = maker_note.try &.all_unknown
       {
-        "tags"             => unknown_tags,
-        "interoperability" => interoperability.try(&.all_unknown),
-        "maker_note"       => maker_note.try(&.all_unknown),
-      }
+        "tags"             => u_tags,
+        "interoperability" => u_interoperability,
+        "maker_note"       => u_maker_note,
+      } if u_tags || u_interoperability || u_maker_note
     end
   end
 
   class ThumbnailIfd < Ifd
     property interoperability : InteroperabilityIfd?
+
+    def all_errors
+      @errors +
+        (interoperability.try(&.all_errors) || [] of Exception)
+    end
 
     register_tags [
       {image_width, 0x0100, UInt16 | UInt32, nil},
@@ -660,6 +831,7 @@ module MakeItRight
       {compression, 0x0103, Compression, nil},
       {photometric_interpretation, 0x0106, PhotometricInterpretation, nil},
       {strip_offsets, 0x0111, Array(UInt16 | UInt32), nil},
+      {orientation, 0x0112, Orientation, nil},
       {samples_per_pixel, 0x0115, UInt16, nil},
       {row_per_strip, 0x0116, UInt16, nil},
       {strip_byte_count, 0x0117, UInt16 | UInt32, nil},
@@ -673,13 +845,19 @@ module MakeItRight
       {ycbcr_sub_sampling, 0x0212, Array(UInt16), nil},
       {ycbcr_positioning, 0x0213, UInt16, nil},
       {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
+      # Sony put those for thumbnail too:
+      {make, 0x010f, String, nil},
+      {model, 0x0110, String, nil},
+      {date_time, 0x0132, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
     ]
 
     def all_unknown
+      u_tags = unknown_tags.empty? ? nil : unknown_tags
+      u_interoperability = interoperability.try &.all_unknown
       {
-        "tags"             => unknown_tags,
-        "interoperability" => interoperability.try &.all_unknown,
-      }
+        "tags"             => u_tags,
+        "interoperability" => u_interoperability,
+      } if u_tags || u_interoperability
     end
   end
 
@@ -688,11 +866,19 @@ module MakeItRight
     property thumbnail : ThumbnailIfd?
     property gps : GpsIfd?
 
+    def all_errors
+      @errors +
+        (exif.try(&.all_errors) || [] of Exception) +
+        (thumbnail.try(&.all_errors) || [] of Exception) +
+        (gps.try(&.all_errors) || [] of Exception)
+    end
+
     register_tags [
       {orientation, 0x0112, Orientation, nil},
       {description, 0x010e, String, nil},
       {make, 0x010f, String, nil},
       {model, 0x0110, String, nil},
+      {artist, 0x013b, String, nil},
       {x_resolution, 0x011a, Rational(UInt32), nil},
       {y_resolution, 0x011b, Rational(UInt32), nil},
       {x_resolution_unit, 0x0128, Unit, nil},
@@ -706,15 +892,45 @@ module MakeItRight
       {copyright, 0x8298, String, nil},
       {exif_offset, 0x8769, self, ->(value : self) { value.exif.try(&.all) }},
       {gps_offset, 0x8825, self, ->(value : self) { value.gps.try(&.all) }},
+      {print_image_matching, 0xc4a5, Bytes, nil}, # No more info
+      {gamma, 0xa500, Rational(UInt32), nil},
+      # WINDOWS XP SHITYARD
+      {title, 0x9c9b, String, nil},
+      {comment, 0x9c9c, String, nil},
+      {author, 0x9c9d, String, nil},
+      {keywords, 0x9c9e, String, nil},
+      {subject, 0x9c9f, String, nil},
+      # Those should be in the EXIF ifd but sometimes they are here
+      {custom_rendered, 0xa401, UInt16, ->(value : UInt16) { value != 0 }},
+      {exposure_mode, 0xa402, ExposureMode, nil},
+      {white_balance, 0xa403, WhiteBalance, nil},
+      {scene_capture_type, 0xa406, SceneType, nil},
+      {contrast, 0xa408, Contrast, nil},
+      {saturation, 0xa409, Saturation, nil},
+      {sharpness, 0xa40a, Sharpness, nil},
+      {subject_distance_range, 0xa40c, DistanceRange, nil},
+      {digital_zoom_ratio, 0xa404, Rational(UInt32), nil},
+      {focal_length_in_35mm_film, 0xa405, UInt16, nil},
+      {gain_control, 0xa407, GainControl, nil},
+
+      # These should be in interoperability, but sometimes they are not
+      {related_image_width, 0x1001, UInt16 | UInt32, nil},
+      {related_image_height, 0x1002, UInt16 | UInt32, nil},
+
     ]
 
     def all_unknown
+      u_tags = unknown_tags.empty? ? nil : unknown_tags
+      u_exif = exif.try(&.all_unknown)
+      u_thumbnail = thumbnail.try(&.all_unknown)
+      u_gps = gps.try(&.all_unknown)
+
       {
-        "tags"      => unknown_tags,
-        "exif"      => exif.try(&.all_unknown),
-        "thumbnail" => thumbnail.try(&.all_unknown),
-        "gps"       => gps.try(&.all_unknown),
-      }
+        "tags"      => u_tags,
+        "exif"      => u_exif,
+        "thumbnail" => u_thumbnail,
+        "gps"       => u_gps,
+      } if u_tags || u_exif || u_thumbnail || u_gps
     end
   end
 
@@ -726,6 +942,10 @@ module MakeItRight
 
     def all_unknown
       nil
+    end
+
+    def all_errors
+      errors
     end
 
     def initialize(io : IO, filters : Enumerable(UInt16)?, io_start, @alignement)
@@ -768,10 +988,36 @@ module MakeItRight
       {date_stamp, 0x001d, String, nil},
       {differential, 0x001e, UInt16, nil},
       {positioning_error, 0x001f, Rational(UInt32), nil},
+      # Tags that belongs to other IFD but there pics in the wild with those in gps
+      {exposure_time, 0x829a, Rational(UInt32), nil},
+      {f_number, 0x829d, Rational(UInt32), nil},
+      {exposure_program, 0x8822, ExposureProgram, nil},
+      {exif_version, 0x9000, Bytes, ->(value : Bytes) { String.new value }}, # not String because it has no null terminator
+      {date_time_original, 0x9003, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
+      {date_time_digitized, 0x9004, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
+      {components_configuration, 0x9101, Bytes, nil}, # maybe parse it,
+      {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.new value }},
+      {focal_length, 0x920a, Rational(UInt32), nil},
+      # This one is gonna make me SO MAD FFS WHY THE FUCK IS IT IN GPS
+      {maker_note_offset, 0x927c, self, ->(value : self) { nil }},
+      {flash_pix_version, 0xa000, Bytes, ->(value : Bytes) { String.new value }}, # No null terminator
+      {color_space, 0xa001, ColorSpace, nil},
+      {exif_image_width, 0xa002, UInt16 | UInt32 | Array(UInt16), nil},
+      {exif_image_height, 0xa003, UInt16 | UInt32 | Array(UInt16), nil},
+      {related_sound_file, 0xa004, String, nil},
+      # THIS ONE TOO
+      {interoperability_offset, 0xa005, self, ->(value : self) { nil }},
+      # Ok so I am gonna have to do a generic ifd shit stuff i guess ?
+
     ]
 
+    # override all_errors and all_unknowns if we add more subifd
+    def all_errors
+      errors
+    end
+
     def all_unknown
-      {"tags" => unknown_tags}
+      unknown_tags unless unknown_tags.empty?
     end
   end
 end
@@ -783,6 +1029,7 @@ unless exif
 end
 puts "Unknown Tags:"
 pp exif.all_unknown
+exif.all
 puts
-puts "Known Tags:"
-pp exif.all
+puts "Errors"
+pp exif.all_errors
