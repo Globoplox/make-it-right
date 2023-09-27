@@ -20,6 +20,7 @@
 # Most way to share image file will cause changes to the image file format, sometimes normalizing the picture, which may actually help until it doesn't and the issue get event harder to understand and fix.
 # This piece of code hope to be a stupid-simple helper for reading/resetting the orientation tag of a jpeg picture, if any.
 # Reference http://www.fifi.org/doc/jhead/exif-e.html#ExifData
+# More complete reference (search site for more) https://www.awaresystems.be/imaging/tiff/tifftags/baseline.html
 module MakeItRight
   VERSION = {{ `shards version __DIR__`.chomp.stringify }}
 
@@ -66,6 +67,14 @@ module MakeItRight
     NONE       = 1
     INCH       = 2
     CENTIMETER = 3
+
+    def self.from_thumbnail(value)
+      case value
+      when 1 then INCH
+      when 2 then CENTIMETER
+      else        UNKNOWN
+      end
+    end
   end
 
   enum ExposureProgram
@@ -128,6 +137,19 @@ module MakeItRight
   enum SensingMethod
     UNKNOWN = 0
     REGULAR = 1
+  end
+
+  enum Compression
+    UNKNOWN = 0
+    NONE    = 1
+    JPEG    = 6
+  end
+
+  enum PhotometricInterpretation
+    UNKNOWN    = 0
+    MONOCHROME = 1
+    RGB        = 2
+    YCBCR      = 6
   end
 
   struct Rational(T)
@@ -259,12 +281,20 @@ module MakeItRight
       if (offset_to_next = main_image_ifd.offset) != 0
         io.pos = start_at + offset_to_next
         thumbnail_ifd = ThumbnailIfd.new io, thumb_filters.try(&.tags), start_at, alignement
+        main_image_ifd.thumbnail = thumbnail_ifd
         if filters.nil? || (interop_filters = thumb_filters.not_nil![:interoperability]?)
           thumbnail_ifd.try &.tags[0xa005]?.try do |interop_offset|
             io.pos = start_at + interop_offset[:value]
             thumbnail_ifd.interoperability = InteroperabilityIfd.new io, interop_filters.try(&.tags), start_at, alignement
           end
         end
+      end
+    end
+
+    if filters.nil? || (gps_filters = filters[:gps]?)
+      main_image_ifd.try &.tags[0x8825]?.try do |gps_offset|
+        io.pos = start_at + gps_offset[:value]
+        main_image_ifd.gps = GpsIfd.new io, gps_filters.try(&.tags), start_at, alignement
       end
     end
 
@@ -299,14 +329,22 @@ module MakeItRight
             value = get_union {{tag}}, {{type}}
           {% elsif type < Enum %}
             value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
+          {% elsif type.id == Array(UInt16 | UInt32).id %}
+            value = get_aui {{tag}}
           {% elsif type.id == Bytes.id %}
             value = get_bytes {{tag}}
           {% elsif type.id == String.id %}
             value = get_string {{tag}}
+          {% elsif type.id == UInt8.id %}
+            value = get_u8 {{tag}}
           {% elsif type.id == UInt16.id %}
             value = get_u16 {{tag}}
+          {% elsif type.id == UInt32.id %}
+            value = get_u32 {{tag}}
           {% elsif type.id == Array(UInt16).id %}
             value = get_au16 {{tag}}
+          {% elsif type.id == Array(UInt32).id %}
+            value = get_au32 {{tag}}
           {% elsif type.id == Rational(UInt32).id %}
             value = get_ur {{tag}}
           {% elsif type.id == Rational(Int32).id %}
@@ -335,6 +373,12 @@ module MakeItRight
           {% end %}
         }
       end
+
+      KNOWN_TAGS = {{tags.map(&.[1])}}
+
+      def unknown_tags
+        @tags.reject KNOWN_TAGS
+      end
     end
 
     # Support only UInt16 and UInt32 as they are the necessary ones
@@ -360,6 +404,13 @@ module MakeItRight
       return unless entry
       raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 3 && entry[:components] == 1
       (entry[:value] >> 16).to_u16!
+    end
+
+    def get_u8(tag : UInt16) : UInt8?
+      entry = @tags[tag]?
+      return unless entry
+      raise Exception.new "This tag is not registered as UInt8" unless entry[:format] == 1 && entry[:components] == 1
+      (entry[:value] >> 24).to_u8!
     end
 
     def get_u32(tag : UInt16) : UInt32?
@@ -428,6 +479,34 @@ module MakeItRight
             io.read_bytes UInt16, @alignement
           end
         end
+      end
+    end
+
+    def get_au32(tag : UInt16) : Array(UInt32)?
+      entry = @tags[tag]?
+      return unless entry
+      raise Exception.new "This tag is not registered as Array(UInt32)" unless entry[:format] == 4
+      if entry[:components] == 0
+        [] of UInt32
+      elsif entry[:components] == 1
+        [entry[:value]]
+      else
+        entry[:raw]?.try do |bytes|
+          io = IO::Memory.new bytes
+          Array(UInt32).new entry[:components] do
+            io.read_bytes UInt32, @alignement
+          end
+        end
+      end
+    end
+
+    def get_aui(tag : UInt16) : Array(UInt16 | UInt32)?
+      entry = @tags[tag]?
+      return unless entry
+      case entry[:format]
+      when 3 then get_au16(tag).map(&.as(UInt16 | UInt32))
+      when 4 then get_au32(tag).map(&.as(UInt16 | UInt32))
+      else        raise Exception.new "This tag is not registered as Array(UInt16 | UInt32)"
       end
     end
 
@@ -511,6 +590,10 @@ module MakeItRight
       {related_image_width, 0x1001, UInt16 | UInt32, nil},
       {related_image_height, 0x1002, UInt16 | UInt32, nil},
     ]
+
+    def all_unknown
+      {"tags" => unknown_tags}
+    end
   end
 
   class ExifIfd < Ifd
@@ -557,15 +640,53 @@ module MakeItRight
       {scene_type, 0xa301, Bytes, nil},
       {cfa_pattern, 0xa302, Bytes, nil},
     ]
+
+    def all_unknown
+      {
+        "tags"             => unknown_tags,
+        "interoperability" => interoperability.try(&.all_unknown),
+        "maker_note"       => maker_note.try(&.all_unknown),
+      }
+    end
   end
 
   class ThumbnailIfd < Ifd
     property interoperability : InteroperabilityIfd?
+
+    register_tags [
+      {image_width, 0x0100, UInt16 | UInt32, nil},
+      {image_height, 0x0101, UInt16 | UInt32, nil},
+      {bit_per_sample, 0x0102, Array(UInt16), nil},
+      {compression, 0x0103, Compression, nil},
+      {photometric_interpretation, 0x0106, PhotometricInterpretation, nil},
+      {strip_offsets, 0x0111, Array(UInt16 | UInt32), nil},
+      {samples_per_pixel, 0x0115, UInt16, nil},
+      {row_per_strip, 0x0116, UInt16, nil},
+      {strip_byte_count, 0x0117, UInt16 | UInt32, nil},
+      {x_resolution, 0x011a, Rational(UInt32), nil},
+      {y_resolution, 0x011b, Rational(UInt32), nil},
+      {planar_configuration, 0x011c, UInt16, nil},                                         # Interpretation vary
+      {resolution_unit, 0x0128, UInt16, ->(value : UInt16) { Unit.from_thumbnail value }}, # Not the same value as other
+      {jpeg_if_offset, 0x0201, UInt32, nil},
+      {jpeg_if_byte_count, 0x0202, UInt32, nil},
+      {ycbcr_coefficients, 0x0211, Array(Rational(UInt32)), nil},
+      {ycbcr_sub_sampling, 0x0212, Array(UInt16), nil},
+      {ycbcr_positioning, 0x0213, UInt16, nil},
+      {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
+    ]
+
+    def all_unknown
+      {
+        "tags"             => unknown_tags,
+        "interoperability" => interoperability.try &.all_unknown,
+      }
+    end
   end
 
   class MainImageIfd < Ifd
     property exif : ExifIfd?
-    property tumbnail : ThumbnailIfd?
+    property thumbnail : ThumbnailIfd?
+    property gps : GpsIfd?
 
     register_tags [
       {orientation, 0x0112, Orientation, nil},
@@ -580,11 +701,21 @@ module MakeItRight
       {white_point, 0x013e, Array(Rational(UInt32)), nil},
       {primary_chromacities, 0x013f, Array(Rational(UInt32)), nil},
       {ycbcr_coefficients, 0x0211, Array(Rational(UInt32)), nil},
-      {ycbcr_positionning, 0x0213, UInt16, nil},
+      {ycbcr_positioning, 0x0213, UInt16, nil},
       {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
       {copyright, 0x8298, String, nil},
       {exif_offset, 0x8769, self, ->(value : self) { value.exif.try(&.all) }},
+      {gps_offset, 0x8825, self, ->(value : self) { value.gps.try(&.all) }},
     ]
+
+    def all_unknown
+      {
+        "tags"      => unknown_tags,
+        "exif"      => exif.try(&.all_unknown),
+        "thumbnail" => thumbnail.try(&.all_unknown),
+        "gps"       => gps.try(&.all_unknown),
+      }
+    end
   end
 
   # Todo. It doesnt parse in the same way as other.
@@ -593,9 +724,54 @@ module MakeItRight
       nil
     end
 
+    def all_unknown
+      nil
+    end
+
     def initialize(io : IO, filters : Enumerable(UInt16)?, io_start, @alignement)
       @offset = 0
       @tags = Hash(UInt16, {format: UInt16, components: UInt32, value: UInt32, raw: Bytes?}).new initial_capacity: 0
+    end
+  end
+
+  class GpsIfd < Ifd
+    register_tags [
+      {gps_version, 0x0000, Bytes, ->(value : Bytes) { String.new value }},
+      {latitude_ref, 0x0001, String, nil},
+      {latitude, 0x0002, Array(Rational(UInt32)), nil},
+      {longitude_ref, 0x0003, String, nil},
+      {longitude, 0x0004, Array(Rational(UInt32)), nil},
+      {altitude_ref, 0x0005, UInt8, nil},
+      {altitude, 0x0006, Rational(UInt32), nil},
+      {timestamp, 0x0007, Array(Rational(UInt32)), nil},
+      {satellites, 0x0008, String, nil},
+      {status, 0x0009, String, nil},
+      {measure_mode, 0x000a, String, nil},
+      {dop, 0x000b, Rational(UInt32), nil},
+      {speed_ref, 0x000c, String, nil},
+      {speed, 0x000d, Rational(UInt32), nil},
+      {track_ref, 0x000e, String, nil},
+      {track, 0x000f, Rational(UInt32), nil},
+      {img_direction_ref, 0x0010, String, nil},
+      {img_direction, 0x0011, Rational(UInt32), nil},
+      {map_datum, 0x0012, String, nil},
+      {dest_latitude_ref, 0x0013, String, nil},
+      {dest_latiture, 0x0014, Array(Rational(UInt32)), nil},
+      {dest_longitude_ref, 0x0015, String, nil},
+      {dest_longitude, 0x0016, Array(Rational(UInt32)), nil},
+      {dest_bearing_ref, 0x0017, String, nil},
+      {dest_bearing, 0x0018, Rational(UInt32), nil},
+      {dest_distance_ref, 0x0019, String, nil},
+      {dest_distance, 0x001a, Rational(UInt32), nil},
+      {processing_method, 0x001b, Bytes, nil},
+      {area_information, 0x001c, Bytes, nil},
+      {date_stamp, 0x001d, String, nil},
+      {differential, 0x001e, UInt16, nil},
+      {positioning_error, 0x001f, Rational(UInt32), nil},
+    ]
+
+    def all_unknown
+      {"tags" => unknown_tags}
     end
   end
 end
@@ -605,4 +781,8 @@ unless exif
   puts "no exif data found"
   exit 0
 end
+puts "Unknown Tags:"
+pp exif.all_unknown
+puts
+puts "Known Tags:"
 pp exif.all
