@@ -9,6 +9,13 @@
 # Theoritically, you shouldn't be able to have a JIF that has both JFIF and EXIF as extension because they have poorly designed specifications,
 # but everyone agreed to ignore those.
 # The result of all this is that when you find a `.jpg` file, it can kind of follows JIF JFIF TIFF EXIF sepc/standard/file-format AT THE SAME TIME.
+# BUT WAIT IT CAN GO DEEPER
+# A JIF (&| JFIF) JPEG file can TIFF (and maybe EXIF), and that TIFF may contain, as a thumbnail, not raw data but an
+# actual JPEG, which can be a JFIF TOO
+# YOU CAN HAVE A JPEG EXIF STANDARD THAT CONTAIN A JFIF IN ITS TIFF
+# This is so wrong
+# Maybe one day I will find a jpeg whose thumbnail has a thumbnail and I wont even be surprised.
+# Probably the thumbnail's thumbnail will be a picture of a very nicely caligraphied "Fuck You"
 # And because it's a mess everything you will find online about will be confused, confusing and contains errors.
 # And even if we try very hard not to care, we are kindof forced to.
 # Because one of the thing EXIF does is that it can include a tag that sya that the image should be displayed in a different oritentation
@@ -19,8 +26,10 @@
 # Most image manipulation library for the backend wont have direct support of this.
 # Most way to share image file will cause changes to the image file format, sometimes normalizing the picture, which may actually help until it doesn't and the issue get event harder to understand and fix.
 # This piece of code hope to be a stupid-simple helper for reading/resetting the orientation tag of a jpeg picture, if any.
-# Reference http://www.fifi.org/doc/jhead/exif-e.html#ExifData
-# More complete reference (search site for more) https://www.awaresystems.be/imaging/tiff/tifftags/baseline.html
+# Reference http://www.fifi.org/doc/jhead/exif-e.html
+# Another reference https://www.awaresystems.be/imaging/tiff/tifftags.html
+# Another reference https://exiftool.org/TagNames/
+# (They all periodically contradict each other, and sometimes even themselves)
 module MakeItRight
   VERSION = {{ `shards version __DIR__`.chomp.stringify }}
 
@@ -195,9 +204,31 @@ module MakeItRight
   end
 
   enum Compression
-    UNKNOWN = 0
-    NONE    = 1
-    JPEG    = 6
+    UNKNOWN       =     0
+    NONE          =     1
+    CCITTRLE      =     2
+    CCITTFAX3     =     3
+    CCITTFAX4     =     4
+    LZW           =     5
+    OJPEG         =     6
+    JPEG          =     7
+    NEXT          = 32766
+    CCITTRLEW     = 32771
+    PACKBITS      = 32773
+    THUNDERSCAN   = 32809
+    IT8CTPAD      = 32895
+    IT8LW         = 32896
+    IT8MP         = 32897
+    IT8BL         = 32898
+    PIXARFILM     = 32908
+    PIXARLOG      = 32909
+    DEFLATE       = 32946
+    ADOBE_DEFLATE =     8
+    DCS           = 32947
+    JBIG          = 34661
+    SGILOG        = 34676
+    SGILOG24      = 34677
+    JP2000        = 34712
   end
 
   enum PhotometricInterpretation
@@ -345,6 +376,12 @@ module MakeItRight
     self.from_tiff io, filters
   end
 
+  def self.from_tiff(path : String | Path, filters : Filters? = nil) : MainImageIfd?
+    File.open path do |io|
+      from_tiff io, filters
+    end
+  end
+
   # Extract tags from a TIFF file
   def self.from_tiff(io : IO, filters : Filters? = nil) : MainImageIfd
     start_at = io.pos
@@ -388,8 +425,20 @@ module MakeItRight
         io.pos = start_at + offset_to_next
         thumbnail_ifd = ThumbnailIfd.new io, thumb_filters.try(&.tags), start_at, alignement
         main_image_ifd.thumbnail = thumbnail_ifd
+
+        if filters.nil? || thumb_filters.not_nil![:data]?
+          data_offset = thumbnail_ifd.tags[0x0201]?.try &.[:value]
+          data_size = thumbnail_ifd.tags[0x0202]?.try &.[:value]
+          if data_offset && data_size && data_offset != 0 && data_size > 0
+            data = Bytes.new data_size
+            io.pos = start_at + data_offset
+            io.read data
+            thumbnail_ifd.data = data
+          end
+        end
+
         if filters.nil? || (interop_filters = thumb_filters.not_nil![:interoperability]?)
-          thumbnail_ifd.try &.tags[0xa005]?.try do |interop_offset|
+          thumbnail_ifd.tags[0xa005]?.try do |interop_offset|
             io.pos = start_at + interop_offset[:value]
             thumbnail_ifd.interoperability = InteroperabilityIfd.new io, interop_filters.try(&.tags), start_at, alignement
           end
@@ -421,43 +470,41 @@ module MakeItRight
         {% name = entry[0] %}
         {% tag = entry[1] %}
         {% type = entry[2] %}
-        {% if type.id == "self".id %}
-        {% elsif type.id.includes? '|' %}
-        {% else %}
-          {% type = type.resolve %}
-        {% end %}
         {% wrapper = entry[3] %}
         def {{name.id.underscore}}
           {% if type.id == "self".id %}
             value = self
-          {% elsif type.id.includes? '|' %}
-            value = get_union {{tag}}, Union({{type}})
-          {% elsif type < Enum %}
-            value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
           {% elsif type.id == Array(UInt16 | UInt32).id %}
             value = get_aui {{tag}}
-          {% elsif type.id == Bytes.id %}
-            value = get_bytes {{tag}}
-          {% elsif type.id == String.id %}
-            value = get_string {{tag}}
-          {% elsif type.id == UInt8.id %}
-            value = get_u8 {{tag}}
-          {% elsif type.id == UInt16.id %}
-            value = get_u16 {{tag}}
-          {% elsif type.id == UInt32.id %}
-            value = get_u32 {{tag}}
-          {% elsif type.id == Array(UInt16).id %}
-            value = get_au16 {{tag}}
-          {% elsif type.id == Array(UInt32).id %}
-            value = get_au32 {{tag}}
-          {% elsif type.id == Rational(UInt32).id %}
-            value = get_ur {{tag}}
-          {% elsif type.id == Rational(Int32).id %}
-            value = get_r {{tag}}
-          {% elsif type.id == Array(Rational(UInt32)).id %}
-            value = get_aur {{tag}}
+          {% elsif type.id.includes? '|' %}
+            value = get_union {{tag}}, Union({{type}})
           {% else %}
-            {% raise "Unknown tag type #{type.id}" %}
+            {% type = type.resolve %}
+            {% if type.resolve < Enum %}
+              value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
+            {% elsif type.id == Bytes.id %}
+              value = get_bytes {{tag}}
+            {% elsif type.id == String.id %}
+              value = get_string {{tag}}
+            {% elsif type.id == UInt8.id %}
+              value = get_u8 {{tag}}
+            {% elsif type.id == UInt16.id %}
+              value = get_u16 {{tag}}
+            {% elsif type.id == UInt32.id %}
+              value = get_u32 {{tag}}
+            {% elsif type.id == Array(UInt16).id %}
+              value = get_au16 {{tag}}
+            {% elsif type.id == Array(UInt32).id %}
+              value = get_au32 {{tag}}
+            {% elsif type.id == Rational(UInt32).id %}
+              value = get_ur {{tag}}
+            {% elsif type.id == Rational(Int32).id %}
+              value = get_r {{tag}}
+            {% elsif type.id == Array(Rational(UInt32)).id %}
+              value = get_aur {{tag}}
+            {% else %}
+              {% raise "Unknown tag type #{type.id}" %}
+            {% end %}
           {% end %}
 
           {% if wrapper %}
@@ -628,8 +675,8 @@ module MakeItRight
       entry = @tags[tag]?
       return unless entry
       case entry[:format]
-      when 3 then get_au16(tag).map(&.as(UInt16 | UInt32))
-      when 4 then get_au32(tag).map(&.as(UInt16 | UInt32))
+      when 3 then get_au16(tag).try &.map(&.as(UInt16 | UInt32))
+      when 4 then get_au32(tag).try &.map(&.as(UInt16 | UInt32))
       else        raise Exception.new "This tag is not registered as Array(UInt16 | UInt32)"
       end
     end
@@ -818,6 +865,7 @@ module MakeItRight
 
   class ThumbnailIfd < Ifd
     property interoperability : InteroperabilityIfd?
+    property data : Bytes?
 
     def all_errors
       @errors +
@@ -918,6 +966,14 @@ module MakeItRight
       {related_image_height, 0x1002, UInt16 | UInt32, nil},
 
     ]
+
+    def all
+      tags = previous_def
+      thumbnail.try do |thumb|
+        return tags.merge Hash{"thumbnail" => thumb.all}
+      end
+      tags
+    end
 
     def all_unknown
       u_tags = unknown_tags.empty? ? nil : unknown_tags
@@ -1021,15 +1077,3 @@ module MakeItRight
     end
   end
 end
-
-exif = MakeItRight.from_jif ARGV.first
-unless exif
-  puts "no exif data found"
-  exit 0
-end
-puts "Unknown Tags:"
-pp exif.all_unknown
-exif.all
-puts
-puts "Errors"
-pp exif.all_errors
