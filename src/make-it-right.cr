@@ -347,13 +347,26 @@ module MakeItRight
       case marker
       when 0xffe1
         # JIF APP1 marker, kind of an extension slot where the TIFF file containing the EXIF data is located.
+        # But because god hate us, there may be multiple APP1 block
+        # Usually one for exif, one for xmp. We need to read
         # See below for the size and - 2 explaination.
         size = io.read_bytes UInt16, IO::ByteFormat::BigEndian
-        # We could use the size to limit the io range, but it has no point really.
-        app1_copy = Bytes.new size - 2
-        io.read app1_copy
-        io.close if close # Closing the file descriptor early
-        return from_exif IO::Memory.new(app1_copy), filters
+        # Now check if this is EXIF or XMP:
+        # EXIF header is 0x45786966 (big endian)
+        # XMP header is "http://ns.adobe.com/xap/1.0/\x00"
+        is_it_exif = io.read_bytes UInt32, IO::ByteFormat::BigEndian
+        if is_it_exif == 0x45786966
+          io.skip 2 # There shoud be 2 null bytes
+          # Now here are the TIFF file embedding the actual EXIF stuff
+          app1_copy = Bytes.new size - 2
+          io.read app1_copy
+          io.close if close # Closing the file descriptor early
+          return from_tiff IO::Memory.new(app1_copy), filters
+        else
+          # This is likely XMP. We could parse it easely but who care.
+          # Skip it, accounting that we parsed the size and 4 addition byte
+          io.skip size - 2 - 4
+        end
       when 0xffd9, 0xffda
         # JIF EOI marker (end of image)
         # ot JIF SOS (start of scan)
@@ -366,14 +379,6 @@ module MakeItRight
         io.skip size - 2 # The size include the bytes used to store the size, hence the - 2
       end
     end
-  end
-
-  # Extract EXIF from an EXIF file
-  def self.from_exif(io : IO, filters : Filters? = nil) : MainImageIfd
-    raise Exception.new "Not an EXIF file" unless 0x45786966 == io.read_bytes UInt32, IO::ByteFormat::BigEndian
-    io.skip 2 # There shoud be 2 null bytes
-    # Tiff header
-    self.from_tiff io, filters
   end
 
   def self.from_tiff(path : String | Path, filters : Filters? = nil) : MainImageIfd?
@@ -403,13 +408,6 @@ module MakeItRight
       main_image_ifd.tags[0x8769]?.try do |exif_offset|
         io.pos = start_at + exif_offset[:value]
         exif = main_image_ifd.exif = ExifIfd.new io, exif_filters.try(&.tags), start_at, alignement
-
-        if filters.nil? || (maker_note_filters = exif_filters.not_nil![:maker_note]?)
-          exif.tags[0x927c]?.try do |maker_note_offset|
-            io.pos = start_at + maker_note_offset[:value]
-            exif.maker_note = MakerNoteIfd.new io, maker_note_filters.try(&.tags), start_at, alignement
-          end
-        end
 
         if filters.nil? || (interop_filters = exif_filters.not_nil![:interoperability]?)
           exif.tags[0xa005]?.try do |interop_offset|
@@ -481,7 +479,6 @@ module MakeItRight
     }
 
     exif_special_tags = {
-      0x927cu16 => 0u32, # Maker note
       0xa005u16 => 0u32, # Interop
     }
 
@@ -512,11 +509,6 @@ module MakeItRight
       if main_special_tags[0x8769] == 0
         raise Exception.new "Exif data present but offset tag missing"
       end
-      pp "WRITING EXIF OFFSET"
-      pp "AT: #{main_special_tags[0x8769].to_s 16}"
-      pp "VALUE: #{io.pos.to_s 16}"
-      # AT is right,
-      # VALUE is not
 
       position = io.pos
       io.pos = main_special_tags[0x8769]
@@ -533,17 +525,6 @@ module MakeItRight
         position.to_u32.to_io io, alignement
         io.pos = position
         interoperability.serialize io, start_at, false, nil
-      end
-
-      exif.maker_note.try do |maker_note|
-        if exif_special_tags[0x927c] == 0
-          raise Exception.new "Maker Note data present but offset tag missing"
-        end
-        position = io.pos
-        io.pos = exif_special_tags[0x927c]
-        position.to_u32.to_io io, alignement
-        io.pos = position
-        maker_note.serialize io, start_at, false, nil
       end
     end
 
@@ -585,17 +566,25 @@ module MakeItRight
   # Given a *input_jif* JIF file, produce a copy of this JIF into *output_jif*
   # With the exif data from *main* inserted or replacing the exif data of *input_jif*
   def self.patch_jif(main : MainImageIfd, input_jif : IO, output_jif : IO)
+    # Read and write SOI
     marker = input_jif.read_bytes UInt16, IO::ByteFormat::BigEndian
     raise Exception.new "Not a JIF file" unless marker == 0xffd8 # JIF SOI marker (start  of image)
     marker.to_io output_jif, IO::ByteFormat::BigEndian
 
     # We write the EXIF data.
     0xffe1u16.to_io output_jif, IO::ByteFormat::BigEndian
-    exif_size_offset = output_jif.pos
+    exif_size_offset = output_jif.pos # This is incorrect
     0x0000u16.to_io output_jif, IO::ByteFormat::BigEndian
-    to_exif main, output_jif
+
+    # Exif header
+    0x45786966u32.to_io output_jif, IO::ByteFormat::BigEndian
+    0u16.to_io output_jif, IO::ByteFormat::BigEndian
+    # Tiff data
+    to_tiff main, output_jif
+
+    # Then we go back to update the APP1 header with the right size, then back again to current pos
     after_exif_offset = output_jif.pos
-    exif_size = after_exif_offset - exif_size_offset + 2
+    exif_size = after_exif_offset - exif_size_offset
     output_jif.pos = exif_size_offset
     if exif_size > UInt16::MAX
       raise Exception.new "The patched EXIF block size is 0x#{exif_size.to_s 16}, which is too big"
@@ -603,13 +592,26 @@ module MakeItRight
     exif_size.to_u16.to_io output_jif, IO::ByteFormat::BigEndian
     output_jif.pos = after_exif_offset
 
+    # Read original pic, copy to dest. If find an exif block in source, omit it from dest.
     loop do
       marker = input_jif.read_bytes UInt16, IO::ByteFormat::BigEndian
       case marker
       when 0xffe1
-        # Original exif data, to skip
+        # Original APP1 header. If it is exif, we skip it, else
+        # it may be XMP, to keep.
         size = input_jif.read_bytes UInt16, IO::ByteFormat::BigEndian
-        input_jif.skip size - 2
+        is_it_exif = input_jif.read_bytes UInt32, IO::ByteFormat::BigEndian
+        if is_it_exif == 0x45786966
+          # Skip it, no copy.
+          input_jif.skip size - 2 - 4
+        else
+          # This is probably xmp, to keep
+          # Write marker, size, part we read to check and the rest
+          marker.to_io output_jif, IO::ByteFormat::BigEndian
+          size.to_io output_jif, IO::ByteFormat::BigEndian
+          is_it_exif.to_io output_jif, IO::ByteFormat::BigEndian
+          IO.copy input_jif, output_jif, size - 2 - 4
+        end
       when 0xffd9, 0xffda
         # JIF EOI marker (end of image)
         # or JIF SOS (start of scan)
@@ -1055,11 +1057,9 @@ module MakeItRight
 
   class ExifIfd < Ifd
     property interoperability : InteroperabilityIfd?
-    property maker_note : MakerNoteIfd?
 
     def all_errors
       @errors +
-        (maker_note.try(&.all_errors) || [] of Exception) +
         (interoperability.try(&.all_errors) || [] of Exception)
     end
 
@@ -1084,7 +1084,7 @@ module MakeItRight
       {light_source, 0x9208, LightSource, nil},
       {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.new value }},
       {focal_length, 0x920a, Rational(UInt32), nil},
-      {maker_note_offset, 0x927c, self, ->(value : self) { value.maker_note.try(&.all) }},
+      {maker_note, 0x927c, Bytes, nil},
       {user_comment, 0x9286, Bytes, ->(value : Bytes) { UserComment.from_value value }},
       {subsec_time, 0x9290, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
       {subsec_time_original, 0x9291, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
@@ -1136,12 +1136,10 @@ module MakeItRight
     def all_unknown
       u_tags = unknown_tags.empty? ? nil : unknown_tags
       u_interoperability = interoperability.try &.all_unknown
-      u_maker_note = maker_note.try &.all_unknown
       {
         "tags"             => u_tags,
         "interoperability" => u_interoperability,
-        "maker_note"       => u_maker_note,
-      } if u_tags || u_interoperability || u_maker_note
+      } if u_tags || u_interoperability
     end
   end
 
@@ -1269,27 +1267,6 @@ module MakeItRight
         "thumbnail" => u_thumbnail,
         "gps"       => u_gps,
       } if u_tags || u_exif || u_thumbnail || u_gps
-    end
-  end
-
-  # Todo. It doesnt parse in the same way as other.
-  class MakerNoteIfd < Ifd
-    def all
-      nil
-    end
-
-    def all_unknown
-      nil
-    end
-
-    def all_errors
-      errors
-    end
-
-    def initialize(io : IO, filters : Enumerable(UInt16)?, io_start, @alignement)
-      @offset_to_next = 0
-      @offset_from_tiff = 0
-      @tags = Hash(UInt16, {format: UInt16, components: UInt32, value: UInt32, raw: Bytes?}).new initial_capacity: 0
     end
   end
 

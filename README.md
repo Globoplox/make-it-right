@@ -1,12 +1,39 @@
 # make-it-right
 
+Important todo/note to myself:
+
+- There might be TWO APP1 (one for EXIF, one for XMP)
+
+- Allow to store original IO offset of tag entry for in place editing
+- Remove filters
+- Remove the close? param and just buffer all and rewrap into an IO.
+- Make sub IFD regular lazy value (Have to handle both 'offset' and 'bytes' flavor)
+  - Including the offset IFD (will need to have a specialized accessor)
+- Maybe allow, for some tags, to cache the value (usefull if complex, like sub IFD)
+- If we parse the IFD from a buffer instead of an IO, we can reduce allocation by slicing the original slice
+  instead of copying it.
+  We could actually have both parameter (io/slice) passed or, if slice, wrap io, if io only, dup when slicing.
+- Maybe merge all the tags within a single IFD type.
+- Ifd#all clear nil tags. Maybe even it should run only for tags present in @tags to avoid useless checks
+
 A pure crystal, zero dependencies EXIF parsing lib.
 It will be much less accurate than tool or binding based on exisiting libs (libexif and exiv2).
 But it might be less of a pity for simplest needs. Exiv2 is c++ so binding are annoying. There are bindings for libexif available that are surely much better than this if you mostly wish to display the data.
 If you just want that damned orientation tag, this lib will be more than enough.
 This lib also attempt to produce programmatically practical values rather than purely visual ones.
 
-## Rapid overview of exif and related for the people that wish they weren't here (like me)
+## Accuracy, testing
+
+Im still working on it but I am using pictures from the exif-sample repository and comparing to exiftool to ensure, as much as possible:
+
+- I detect all the tags (not yet, there are oddities (subifd where there should not, and maker_note))
+- I know all the tags (All the one I detect at least lol)
+- I successfully parse all the tags
+- I can read then write to the same jpeg and produce an
+  image identical to the source (when possible, there might be ordering that change, but it should be valid)
+- In the future, i will have to test that writing tags work correctly
+
+## Rapid overview of exif and related for the people that wish they weren't here (like me) SKIP if you already KnowTheThings™
 
 JPEG is a compression method for image.
 JIF is a file format for storing JPEG compressed image.
@@ -150,17 +177,20 @@ end
 
 ### TODO
 
-- [ ] Tag write
-- [ ] Serialize
-- [ ] Write in place into JPEG (zero previous, write over (must have enough space)
 - [ ] Write into JPEG (parse JIF, omit existing, insert)
+- [ ] Tag write
+- [ ] Write in place into JPEG (zero previous, write over (must have enough space)
 - [ ] Remove from JPEG
 - [ ] Pluto integration
 
 ### TODO but probably wont do
 
 - [ ] Maker Note (im a coward)
-- [ ] JFIF tags
+- [ ] Swapping endianess
+- [ ] Parse JFIF (APP0)
+- [ ] Parse XMP (APP1 but not exif)
+- [ ] Parse ICC (APPx idk)
+- [ ] Parse Photoshop metadata (APPx idk)
 - [ ] Parse from TIFF (who care)
 - [ ] Parse from PNG (barely standard)
 - [ ] Parse from HEIC (what is this)
