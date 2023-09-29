@@ -33,10 +33,6 @@
 module MakeItRight
   VERSION = {{ `shards version __DIR__`.chomp.stringify }}
 
-  def self.just_give_me_the_orientation(param)
-    MakeItRight.from_jif(param, MakeItRight::Filters{:tags => [0x0112u16]}).try &.orientation
-  end
-
   class Exception < ::Exception
   end
 
@@ -54,25 +50,6 @@ module MakeItRight
         raw_data: #{@raw.try { |raw| "0x#{raw.map(&.to_s 16).join}" } || "none"}
 
       STR
-    end
-  end
-
-  class Filters
-    property tags : Enumerable(UInt16)?
-    property subs : Hash(Symbol, Filters)?
-
-    def initialize(@tags = nil, @subs = nil)
-    end
-
-    def []?(symbol : Symbol)
-      subs.try &.[symbol]?
-    end
-
-    def []=(symbol : Symbol, value : Enumerable(UInt16) | Filters)
-      case value
-      when Enumerable(UInt16) then @tags = value
-      when Filters            then (@subs ||= ({} of Symbol => Filters))[symbol] = value
-      end
     end
   end
 
@@ -331,14 +308,14 @@ module MakeItRight
     end
   end
 
-  def self.from_jif(path : String | Path, filters : Filters? = nil) : MainImageIfd?
+  def self.from_jif(path : String | Path) : Tiff?
     File.open path do |io|
-      from_jif io, filters, close: true
+      from_jif io, close: true
     end
   end
 
   # Extract tags from a JIF file.
-  def self.from_jif(io : IO, filters : Filters? = nil, close = false) : MainImageIfd?
+  def self.from_jif(io : IO, close = false) : Tiff?
     # Parse the JIF searching for the APP1 marker, ingoring everything else.
     marker = io.read_bytes UInt16, IO::ByteFormat::BigEndian
     raise Exception.new "Not a JIF file" unless marker == 0xffd8 # JIF SOI marker (start  of image)
@@ -361,7 +338,7 @@ module MakeItRight
           app1_copy = Bytes.new size - 2
           io.read app1_copy
           io.close if close # Closing the file descriptor early
-          return from_tiff IO::Memory.new(app1_copy), filters
+          return Tiff.new app1_copy
         else
           # This is likely XMP. We could parse it easely but who care.
           # Skip it, accounting that we parsed the size and 4 addition byte
@@ -381,14 +358,15 @@ module MakeItRight
     end
   end
 
-  def self.from_tiff(path : String | Path, filters : Filters? = nil) : MainImageIfd?
+  def self.from_tiff(path : String | Path) : Tiff?
     File.open path do |io|
-      from_tiff io, filters
+      Tiff.new io.getb_to_end
     end
   end
 
   # Extract tags from a TIFF file
-  def self.from_tiff(io : IO, filters : Filters? = nil) : MainImageIfd
+  # UNUSZD
+  def self.from_tiff(io : IO) : MainImageIfd
     start_at = io.pos
     # Parse TIFF header
     case io.read_bytes UInt16, IO::ByteFormat::BigEndian
@@ -402,53 +380,41 @@ module MakeItRight
     io.pos = start_at + offset
 
     # Parse IFD according to filters
-    main_image_ifd = MainImageIfd.new io, filters.try(&.tags), start_at, alignement
+    main_image_ifd = MainImageIfd.new io, start_at, alignement
 
-    if filters.nil? || (exif_filters = filters[:exif]?)
-      main_image_ifd.tags[0x8769]?.try do |exif_offset|
-        io.pos = start_at + exif_offset[:value]
-        exif = main_image_ifd.exif = ExifIfd.new io, exif_filters.try(&.tags), start_at, alignement
+    main_image_ifd.tags[0x8769]?.try do |exif_offset|
+      io.pos = start_at + exif_offset[:value]
+      exif = main_image_ifd.exif = ExifIfd.new io, start_at, alignement
 
-        if filters.nil? || (interop_filters = exif_filters.not_nil![:interoperability]?)
-          exif.tags[0xa005]?.try do |interop_offset|
-            io.pos = start_at + interop_offset[:value]
-            exif.interoperability = InteroperabilityIfd.new io, interop_filters.try(&.tags), start_at, alignement
-          end
-        end
+      exif.tags[0xa005]?.try do |interop_offset|
+        io.pos = start_at + interop_offset[:value]
+        exif.interoperability = InteroperabilityIfd.new io, start_at, alignement
       end
     end
 
-    if filters.nil? || (thumb_filters = filters[:thumbnail]?)
-      if (offset_to_next = main_image_ifd.offset_to_next) != 0
-        io.pos = start_at + offset_to_next
-        thumbnail_ifd = ThumbnailIfd.new io, thumb_filters.try(&.tags), start_at, alignement
-        main_image_ifd.thumbnail = thumbnail_ifd
+    if (offset_to_next = main_image_ifd.offset_to_next) != 0
+      io.pos = start_at + offset_to_next
+      thumbnail_ifd = ThumbnailIfd.new io, start_at, alignement
+      main_image_ifd.thumbnail = thumbnail_ifd
 
-        if filters.nil? || thumb_filters.not_nil![:data]?
-          data_offset = thumbnail_ifd.tags[0x0201]?.try &.[:value]
-          data_size = thumbnail_ifd.tags[0x0202]?.try &.[:value]
-          if data_offset && data_size && data_offset != 0 && data_size > 0
-            data = Bytes.new data_size
-            io.pos = start_at + data_offset
-            io.read data
-            thumbnail_ifd.data = data
-          end
-        end
+      data_offset = thumbnail_ifd.tags[0x0201]?.try &.[:value]
+      data_size = thumbnail_ifd.tags[0x0202]?.try &.[:value]
+      if data_offset && data_size && data_offset != 0 && data_size > 0
+        data = Bytes.new data_size
+        io.pos = start_at + data_offset
+        io.read data
+        thumbnail_ifd.data = data
+      end
 
-        if filters.nil? || (interop_filters = thumb_filters.not_nil![:interoperability]?)
-          thumbnail_ifd.tags[0xa005]?.try do |interop_offset|
-            io.pos = start_at + interop_offset[:value]
-            thumbnail_ifd.interoperability = InteroperabilityIfd.new io, interop_filters.try(&.tags), start_at, alignement
-          end
-        end
+      thumbnail_ifd.tags[0xa005]?.try do |interop_offset|
+        io.pos = start_at + interop_offset[:value]
+        thumbnail_ifd.interoperability = InteroperabilityIfd.new io, start_at, alignement
       end
     end
 
-    if filters.nil? || (gps_filters = filters[:gps]?)
-      main_image_ifd.try &.tags[0x8825]?.try do |gps_offset|
-        io.pos = start_at + gps_offset[:value]
-        main_image_ifd.gps = GpsIfd.new io, gps_filters.try(&.tags), start_at, alignement
-      end
+    main_image_ifd.try &.tags[0x8825]?.try do |gps_offset|
+      io.pos = start_at + gps_offset[:value]
+      main_image_ifd.gps = GpsIfd.new io, start_at, alignement
     end
 
     main_image_ifd
@@ -557,12 +523,6 @@ module MakeItRight
     end
   end
 
-  def self.to_exif(main : MainImageIfd, io : IO)
-    0x45786966u32.to_io io, IO::ByteFormat::BigEndian
-    0u16.to_io io, IO::ByteFormat::BigEndian
-    to_tiff main, io
-  end
-
   # Given a *input_jif* JIF file, produce a copy of this JIF into *output_jif*
   # With the exif data from *main* inserted or replacing the exif data of *input_jif*
   def self.patch_jif(main : MainImageIfd, input_jif : IO, output_jif : IO)
@@ -663,16 +623,7 @@ module MakeItRight
   # Basically just a bunch of tag together.
   # This is a tree structure, ifd can contain tags that point to other ifd.
   class Ifd
-    getter offset_to_next : UInt32
-
-    protected getter tags
-    protected getter alignement
-
-    # To make in place write easier
-    getter offset_from_tiff : Int32
-
-    @alignement : IO::ByteFormat
-    @errors = [] of ::Exception
+    alias Summary = String | Hash(String, Summary) | Nil
 
     macro register_tags(tags)
       {% for entry in tags %}
@@ -691,6 +642,8 @@ module MakeItRight
             {% type = type.resolve %}
             {% if type.resolve < Enum %}
               value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
+            {% elsif type.id == Ifd.id %}
+              value = get_subifd {{tag}}
             {% elsif type.id == Bytes.id %}
               value = get_bytes {{tag}}
             {% elsif type.id == String.id %}
@@ -738,13 +691,20 @@ module MakeItRight
         end
       {% end %}
       
+    
+
       def all
-        {
-          {% for entry in tags %}
-            {% name = entry[0] %}
-            "{{name.id}}" => {{name.id.underscore}},
+        summary = Hash(String, Summary).new initial_capacity: {{tags.size}}
+        {% for entry in tags %}
+          {% name = entry[0] %}
+          {% type = entry[2] %}
+          {% if type.is_a? Path && type.resolve.id == Ifd.id %}
+            summary["{{name.id}}"] = {{name.id.underscore}}.try(&.all)
+          {% else %}
+            summary["{{name.id}}"] = {{name.id.underscore}}.try(&.to_s)
           {% end %}
-        }
+        {% end %}
+        summary
       end
 
       KNOWN_TAGS = {{tags.map(&.[1])}}
@@ -754,8 +714,10 @@ module MakeItRight
       end
     end
 
-    def errors
-      @errors
+    def get_subifd(tag : UInt16) : Ifd?
+      entry = @tags[tag]?
+      return unless entry
+      Ifd.new @tiff, entry[:value]
     end
 
     # Support UInt16, UInt32, Array(UInt16) as they are the necessary ones
@@ -807,8 +769,8 @@ module MakeItRight
       entry[:raw]?.try do |bytes|
         io = IO::Memory.new bytes
         Rational(UInt32).new(
-          io.read_bytes(UInt32, @alignement),
-          io.read_bytes(UInt32, @alignement)
+          io.read_bytes(UInt32, @tiff.alignement),
+          io.read_bytes(UInt32, @tiff.alignement)
         )
       end
     end
@@ -834,8 +796,8 @@ module MakeItRight
         io = IO::Memory.new bytes
         Array(Rational(UInt32)).new entry[:components] do
           Rational(UInt32).new(
-            io.read_bytes(UInt32, @alignement),
-            io.read_bytes(UInt32, @alignement)
+            io.read_bytes(UInt32, @tiff.alignement),
+            io.read_bytes(UInt32, @tiff.alignement)
           )
         end
       end
@@ -856,7 +818,7 @@ module MakeItRight
         entry[:raw]?.try do |bytes|
           io = IO::Memory.new bytes
           Array(UInt16).new entry[:components] do
-            io.read_bytes UInt16, @alignement
+            io.read_bytes UInt16, @tiff.alignement
           end
         end
       end
@@ -874,7 +836,7 @@ module MakeItRight
         entry[:raw]?.try do |bytes|
           io = IO::Memory.new bytes
           Array(UInt32).new entry[:components] do
-            io.read_bytes UInt32, @alignement
+            io.read_bytes UInt32, @tiff.alignement
           end
         end
       end
@@ -921,46 +883,49 @@ module MakeItRight
       end
     end
 
-    # *tiff_start_at* is the position of the tiff within the IO
-    def initialize(io : IO, filters : Enumerable(UInt16)?, tiff_start_at, @alignement)
-      @offset_from_tiff = io.pos - tiff_start_at
-      entries_count = io.read_bytes UInt16, @alignement
+    protected getter tags
+    getter errors = [] of ::Exception
+    @offset_to_next : UInt32
+
+    def initialize(@tiff : Tiff, @offset : UInt32)
+      io = @tiff.io
+      alignement = @tiff.alignement
+      entries_count = io.read_bytes UInt16, alignement
       @tags = Hash(UInt16, {format: UInt16, components: UInt32, value: UInt32, raw: Bytes?}).new initial_capacity: entries_count
       (0...entries_count).each do
-        tag = io.read_bytes UInt16, @alignement
-        if filters.nil? || filters.includes? tag
-          format = io.read_bytes UInt16, @alignement
-          components_amount = io.read_bytes UInt32, @alignement
-          value_or_offset = io.read_bytes UInt32, @alignement
+        tag = io.read_bytes UInt16, alignement
+        format = io.read_bytes UInt16, alignement
+        components_amount = io.read_bytes UInt32, alignement
+        value_or_offset = io.read_bytes UInt32, alignement
 
-          case format
-          when 1, 2, 6, 7 then byte_per_components = 1
-          when 3, 8       then byte_per_components = 2
-          when 4, 9, 11   then byte_per_components = 4
-          when 5, 10, 12  then byte_per_components = 8
-          end
-
-          if byte_per_components.nil?
-            @errors << Exception.new "Bad format for tag 0x#{tag.to_s 16}: 0x#{format}"
-            next
-          elsif byte_per_components * components_amount > 4
-            bytes = Bytes.new byte_per_components * components_amount
-          end
-
-          @tags[tag] = {
-            format:     format,
-            components: components_amount,
-            value:      value_or_offset,
-            raw:        bytes,
-          }
+        case format
+        when 1, 2, 6, 7 then byte_per_components = 1
+        when 3, 8       then byte_per_components = 2
+        when 4, 9, 11   then byte_per_components = 4
+        when 5, 10, 12  then byte_per_components = 8
         end
+
+        if byte_per_components.nil?
+          @errors << Exception.new "Bad format for tag 0x#{tag.to_s 16}: 0x#{format}"
+          next
+        elsif byte_per_components * components_amount > 4
+          # slice from tiff buffer instead (also no need to copy value later)
+          bytes = Bytes.new byte_per_components * components_amount
+        end
+
+        @tags[tag] = {
+          format:     format,
+          components: components_amount,
+          value:      value_or_offset,
+          raw:        bytes,
+        }
       end
-      @offset_to_next = io.read_bytes UInt32, @alignement
+      @offset_to_next = io.read_bytes UInt32, alignement
 
       # Copy the raw value data for selected tags whose values is an offset to raw data
       @tags.values.each do |entry|
         if bytes = entry[:raw]
-          io.pos = tiff_start_at + entry[:value]
+          io.pos = entry[:value]
           io.read bytes
         end
       end
@@ -1189,18 +1154,7 @@ module MakeItRight
     end
   end
 
-  class MainImageIfd < Ifd
-    property exif : ExifIfd?
-    property thumbnail : ThumbnailIfd?
-    property gps : GpsIfd?
-
-    def all_errors
-      @errors +
-        (exif.try(&.all_errors) || [] of Exception) +
-        (thumbnail.try(&.all_errors) || [] of Exception) +
-        (gps.try(&.all_errors) || [] of Exception)
-    end
-
+  class Ifd
     register_tags [
       {orientation, 0x0112, Orientation, nil},
       {description, 0x010e, String, nil},
@@ -1218,8 +1172,8 @@ module MakeItRight
       {ycbcr_positioning, 0x0213, UInt16, nil},
       {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
       {copyright, 0x8298, String, nil},
-      {exif_offset, 0x8769, self, ->(value : self) { value.exif.try(&.all) }},
-      {gps_offset, 0x8825, self, ->(value : self) { value.gps.try(&.all) }},
+      {exif, 0x8769, Ifd, nil},
+      {gps, 0x8825, Ifd, nil},
       {print_image_matching, 0xc4a5, Bytes, nil}, # No more info
       {gamma, 0xa500, Rational(UInt32), nil},
       # WINDOWS XP SHITYARD
@@ -1246,28 +1200,6 @@ module MakeItRight
       {related_image_height, 0x1002, UInt16 | UInt32, nil},
 
     ]
-
-    def all
-      tags = previous_def
-      thumbnail.try do |thumb|
-        return tags.merge Hash{"thumbnail" => thumb.all}
-      end
-      tags
-    end
-
-    def all_unknown
-      u_tags = unknown_tags.empty? ? nil : unknown_tags
-      u_exif = exif.try(&.all_unknown)
-      u_thumbnail = thumbnail.try(&.all_unknown)
-      u_gps = gps.try(&.all_unknown)
-
-      {
-        "tags"      => u_tags,
-        "exif"      => u_exif,
-        "thumbnail" => u_thumbnail,
-        "gps"       => u_gps,
-      } if u_tags || u_exif || u_thumbnail || u_gps
-    end
   end
 
   class GpsIfd < Ifd
@@ -1336,10 +1268,42 @@ module MakeItRight
       unknown_tags unless unknown_tags.empty?
     end
   end
+
+  class Tiff < Ifd
+    @alignement : IO::ByteFormat
+    @buffer : Bytes
+    @io : IO
+
+    getter alignement
+    getter buffer
+    getter io
+
+    def initialize(@buffer)
+      @io = IO::Memory.new @buffer
+      # Parse TIFF header
+      case io.read_bytes UInt16, IO::ByteFormat::BigEndian
+      when 0x4d4d then @alignement = IO::ByteFormat::BigEndian
+      when 0x4949 then @alignement = IO::ByteFormat::LittleEndian
+      else             raise Exception.new "Bad alignment entry in TIFF header"
+      end
+      magic = io.read_bytes UInt16, alignement
+      raise Exception.new "Bad magic entry in TIFF header: 0x#{magic.to_s 16}" unless 0x002a == magic
+      offset = io.read_bytes UInt32, alignement
+      super self, offset
+    end
+  end
 end
 
-MakeItRight.patch_jif ARGV.first, "result.jpg" do |tags|
-  puts "Input tags:"
-  pp tags.all
-  # We can edit the tags if we feel like it
+tiff = MakeItRight.from_jif ARGV.first
+if tiff
+  puts "All the tags:"
+  pp tiff.all
+else
+  puts "No tiff data found"
 end
+
+# MakeItRight.patch_jif ARGV.first, "result.jpg" do |tags|
+#  puts "Input tags:"
+#  pp tags.all
+#  # We can edit the tags if we feel like it
+# end
