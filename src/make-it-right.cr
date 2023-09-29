@@ -367,112 +367,9 @@ module MakeItRight
     end
   end
 
-  # Thing to think about:
-  # - Not busting total max size of 64kb - exif header
-  # - Not moving the maker_note => they are not supported anyway so no.
-  def self.to_tiff(main : MainImageIfd, io : IO)
-    start_at = io.pos
-    alignement = main.alignement
-    # TIFF header
-    if alignement == IO::ByteFormat::BigEndian
-      0x4d4du16.to_io io, alignement
-    elsif alignement == IO::ByteFormat::LittleEndian
-      0x4949u16.to_io io, alignement
-    else
-      raise Exception.new "Bad alignment: #{alignement}"
-    end
-    0x002au16.to_io io, alignement
-    0x8u32.to_io io, alignement
-
-    # Address of ifd/othre payload value, relative to IO,
-    # To be filled by Ifd.serialize
-    main_special_tags = {
-      0x8769u16 => 0u32, # Exif
-      0x8825u16 => 0u32, # Gps
-    }
-
-    exif_special_tags = {
-      0xa005u16 => 0u32, # Interop
-    }
-
-    thumb_special_tags = {
-      0xa005u16 => 0u32, # Interop
-      0x0201u16 => 0u32, # Tumbnail data offset
-      0x0202u16 => 0u32, # Tumbnail data size
-    }
-
-    main.serialize(io, start_at, main.thumbnail != nil, main_special_tags)
-
-    main.thumbnail.try do |thumbnail|
-      thumbnail.serialize io, start_at, false, thumb_special_tags
-      thumbnail.interoperability.try do |interoperability|
-        if thumb_special_tags[0xa005] == 0
-          raise Exception.new "Thumbnail Interoperability data present but offset tag missing"
-        end
-        position = io.pos
-        io.pos = thumb_special_tags[0xa005]
-        position.to_u32.to_io io, alignement
-        io.pos = position
-        interoperability.serialize io, start_at, false, nil
-      end
-    end
-
-    # exif
-    main.exif.try do |exif|
-      if main_special_tags[0x8769] == 0
-        raise Exception.new "Exif data present but offset tag missing"
-      end
-
-      position = io.pos
-      io.pos = main_special_tags[0x8769]
-      (position - start_at).to_u32.to_io io, alignement
-      io.pos = position
-
-      exif.serialize io, start_at, false, exif_special_tags
-      exif.interoperability.try do |interoperability|
-        if exif_special_tags[0xa005] == 0
-          raise Exception.new "Exif Interoperability data present but offset tag missing"
-        end
-        position = io.pos
-        io.pos = exif_special_tags[0xa005]
-        position.to_u32.to_io io, alignement
-        io.pos = position
-        interoperability.serialize io, start_at, false, nil
-      end
-    end
-
-    # gps
-    main.gps.try do |gps|
-      if main_special_tags[0x8825] == 0
-        raise Exception.new "Gps data present but offset tag missing"
-      end
-      position = io.pos
-      io.pos = main_special_tags[0x8825]
-      position.to_u32.to_io io, alignement
-      io.pos = position
-      gps.serialize io, start_at, false, nil
-    end
-
-    # Thumbnail data
-    main.thumbnail.try do |thumbnail|
-      thumbnail.data.try do |data|
-        if thumb_special_tags[0x0201] == 0 || thumb_special_tags[0x0202] == 0
-          raise Exception.new "Thumbnail data present but offset/size tags missing"
-        end
-        position = io.pos
-        io.pos = thumb_special_tags[0x0201]
-        position.to_u32.to_io io, alignement
-        io.pos = thumb_special_tags[0x0202]
-        data.size.to_u32.to_io io, alignement
-        io.pos = position
-        io.write data
-      end
-    end
-  end
-
   # Given a *input_jif* JIF file, produce a copy of this JIF into *output_jif*
   # With the exif data from *main* inserted or replacing the exif data of *input_jif*
-  def self.patch_jif(main : MainImageIfd, input_jif : IO, output_jif : IO)
+  def self.patch_jif(tiff : Tiff, input_jif : IO, output_jif : IO)
     # Read and write SOI
     marker = input_jif.read_bytes UInt16, IO::ByteFormat::BigEndian
     raise Exception.new "Not a JIF file" unless marker == 0xffd8 # JIF SOI marker (start  of image)
@@ -487,7 +384,7 @@ module MakeItRight
     0x45786966u32.to_io output_jif, IO::ByteFormat::BigEndian
     0u16.to_io output_jif, IO::ByteFormat::BigEndian
     # Tiff data
-    to_tiff main, output_jif
+    tiff.serialize output_jif
 
     # Then we go back to update the APP1 header with the right size, then back again to current pos
     after_exif_offset = output_jif.pos
@@ -541,22 +438,22 @@ module MakeItRight
 
   # Given a *input_jif* JIF file, produce a copy of this JIF into *output_jif*
   # With the exif data from *main* inserted or replacing the exif data of *input_jif*
-  def self.patch_jif(main : MainImageIfd, input_jif : Path | String, output_jif : Path | String)
+  def self.patch_jif(tiff : Tiff, input_jif : Path | String, output_jif : Path | String)
     File.open input_jif, "r" do |input|
       File.open output_jif, "w" do |output|
-        patch_jif main, input, output
+        patch_jif tiff, input, output
       end
     end
   end
 
   def self.patch_jif(input_jif : Path | String, output_jif : Path | String, &)
     File.open input_jif, "r" do |input|
-      main = self.from_jif input
-      if main
-        yield main
+      tiff = self.from_jif input
+      if tiff
+        yield tiff
         input.rewind
         File.open output_jif, "w" do |output|
-          patch_jif main, input, output
+          patch_jif tiff, input, output
         end
       end
     end
@@ -698,7 +595,7 @@ module MakeItRight
     protected def get_subifd(type, tag : UInt16) : Ifd?
       entry = @tags[tag]?
       return unless entry
-      type.new @tiff, entry[:value]
+      type.new @tiff, entry[:value], tag
     end
 
     # Support UInt16, UInt32, Array(UInt16) as they are the necessary ones
@@ -865,7 +762,13 @@ module MakeItRight
     end
 
     def next : Ifd?
-      @offset_to_next != 0 ? Ifd.new(@tiff, @offset_to_next) : nil
+      @offset_to_next != 0 ? Ifd.new(@tiff, @offset_to_next, nil) : nil
+    end
+
+    def payload : Bytes?
+      if (data_offset = @tags[0x0201]?) && (data_size = @tags[0x0202]?)
+        @tiff.buffer[data_offset[:value], data_size[:value]]
+      end
     end
 
     protected getter tags
@@ -884,9 +787,24 @@ module MakeItRight
       end
     end
 
-    def initialize(@tiff : Tiff, @offset : UInt32)
+    # Usefull to have overridtable for handling of maker note
+    def alignement
+      @tiff.alignement
+    end
+
+    def io
+      @tiff.io
+    end
+
+    def buffer
+      @tiff.buffer
+    end
+
+    # The tag that contained the offset of this as a subifd.
+    protected getter origin_tag
+
+    def initialize(@tiff : Tiff, @offset : UInt32, @origin_tag : UInt16?)
       io = @tiff.io
-      alignement = @tiff.alignement
       buffer = @tiff.buffer
       io.pos = @offset
       entries_count = io.read_bytes UInt16, alignement
@@ -926,24 +844,19 @@ module MakeItRight
       io.skip data_size
     end
 
-    # *tiff_start_at* is the offset to TIFF relative to IO
-    # This will write the header then the data payloads if any.
-    # If *has_next* is true, it set the offset to next ifd to after the data payload.
-    # *special_tags* is a table mapping tags to tags value offset in IO that must be filled
-    def serialize(io, tiff_start_at, has_next : Bool, special_tags : Hash(UInt16, UInt32)?)
-      # Write header
-      # Offset to here relative to TIFF
-      offset_to_header = io.pos - tiff_start_at
-      header_size = 6 + @tags.size * 12
-      @tags.size.to_u16.to_io io, @alignement
+    def serialize(output : IO)
+      pp "IFD START SERIALISATION AT 0x#{output.pos.to_s 16}, #{@tags.size} TAGS"
+      @tags.size.to_u16.to_io output, alignement
+      data_offset = output.pos + 4 + @tags.size * 12
+      # Subifd tags and the offset in header to their value offset
+      # It make sense I promise
+      subifd_offsets = [] of {ifd: Ifd, offset: UInt32}
 
-      data_offset = offset_to_header + header_size
       @tags.each do |tag, entry|
         # write tag
-        tag.to_io io, @alignement
-        entry[:format].to_io io, @alignement
-        entry[:components].to_io io, @alignement
-
+        tag.to_io output, alignement
+        entry[:format].to_io output, alignement
+        entry[:components].to_io output, alignement
         case entry[:format]
         when 1, 2, 6, 7 then byte_per_components = 1
         when 3, 8       then byte_per_components = 2
@@ -951,48 +864,68 @@ module MakeItRight
         when 5, 10, 12  then byte_per_components = 8
         else                 byte_per_components = 0
         end
-
-        special_tags[tag] = io.pos.to_u32 if special_tags[tag]? if special_tags
-
         raw = entry[:raw]
         bytes = byte_per_components * entry[:components]
-        if bytes > 4
-          if raw.nil?
-            raise Exception.new "Raw data missing for tag value size larger than 4 byte in tag #{tag}"
-          end
-          if bytes != raw.size
-            raise Exception.new "Raw data size #{raw.size} and format * component size #{bytes} does not match in tag #{tag}"
-          end
 
-          data_offset.to_u32.to_io io, @alignement
+        if subifd = subifds.find(&.origin_tag.== tag)
+          subifd_offsets << {ifd: subifd, offset: io.pos.to_u32}
+          # Should increase data offset by size of ifd.
+          # But this is hard to preedict, so instead we write the ifd after all values.
+
+        end
+
+        if bytes > 4
+          raise Exception.new "Raw data missing for large tag value size in tag #{tag}" if raw.nil?
+          raise Exception.new "Raw data size #{raw.size} should be #{bytes} in tag #{tag}" if bytes != raw.size
+          data_offset.to_u32.to_io output, alignement
           data_offset += bytes
-          # It is not mentionned anywhere is specs but exiftool thinks its odd if absent
           data_offset += 1 if data_offset.odd?
         else
-          raise Exception.new "Raw data found for tag value size smaller or equal to 4 byte in tag #{tag}" if raw
-          entry[:value].to_io io, @alignement
+          raise Exception.new "Raw data found for small tag value size in tag #{tag}" if raw
+          entry[:value].to_io output, alignement
         end
       end
 
-      if has_next
-        data_offset.to_u32.to_io io, @alignement
-      else
-        0u32.to_io io, @alignement
-      end
+      offset_to_offset_to_next = output.pos
+      0u32.to_io output, alignement
 
-      # Write data
+      # write values
       pad_count = 0
       @tags.each do |tag, entry|
-        raw = entry[:raw]
-        if raw
-          io.write raw
+        entry[:raw].try do |raw|
+          output.write raw
           if raw.size.odd?
             pad_count += raw.size + 1
-            0x0u8.to_io io, @alignement
+            0x0u8.to_io output, alignement
           else
             pad_count += raw.size
           end
         end
+      end
+
+      # Write Subifd.
+      @tags.each do |tag, entry|
+        if subifd_entry = subifd_offsets.find &.[:ifd].origin_tag.== tag
+          # This is a sub ifd to serialize
+          current_pos = output.pos
+          output.pos = subifd_entry[:offset]
+          current_pos.to_u32.to_io output, alignement
+          output.pos = current_pos
+          subifd_entry[:ifd].serialize output
+        end
+      end
+
+      # write next if next (using offset_to_offset_to_next)
+      self.next.try do |ifd|
+        current_pos = output.pos
+        output.pos = offset_to_offset_to_next
+        current_pos.to_u32.to_io output, alignement
+        output.pos = current_pos
+        ifd.serialize output
+      end
+
+      payload.try do |payload|
+        output.write payload
       end
     end
   end
@@ -1170,15 +1103,35 @@ module MakeItRight
     def initialize(@buffer)
       @io = IO::Memory.new @buffer
       # Parse TIFF header
-      case io.read_bytes UInt16, IO::ByteFormat::BigEndian
+      case @io.read_bytes UInt16, IO::ByteFormat::BigEndian
       when 0x4d4d then @alignement = IO::ByteFormat::BigEndian
       when 0x4949 then @alignement = IO::ByteFormat::LittleEndian
       else             raise Exception.new "Bad alignment entry in TIFF header"
       end
-      magic = io.read_bytes UInt16, alignement
+      magic = @io.read_bytes UInt16, @alignement
       raise Exception.new "Bad magic entry in TIFF header: 0x#{magic.to_s 16}" unless 0x002a == magic
-      offset = io.read_bytes UInt32, alignement
-      super self, offset
+      offset = @io.read_bytes UInt32, @alignement
+      super self, offset, nil
+    end
+
+    def serialize(copy_to : IO? = nil) : IO
+      output = IO::Memory.new
+      # Output might not be repositionnable
+      if @alignement == IO::ByteFormat::BigEndian
+        0x4d4du16.to_io output, @alignement
+      elsif @alignement == IO::ByteFormat::LittleEndian
+        0x4949u16.to_io output, @alignement
+      else
+        raise Exception.new "Bad alignment: #{@alignement}"
+      end
+      0x002au16.to_io output, @alignement
+      0x8u32.to_io output, @alignement
+      super output
+      size = output.pos # Weird stuff
+      output.rewind
+      IO.copy output, copy_to, size if copy_to
+
+      output
     end
   end
 end
@@ -1193,15 +1146,8 @@ if tiff
   puts
   puts "All errors:"
   pp tiff.all_errors
-  puts
-  pp tiff.subifds.size
-  pp tiff.subifds.map(&.subifds.size)
+  puts "Rewriting to result.jpg"
+  MakeItRight.patch_jif tiff, ARGV.first, "result.jpg"
 else
   puts "No tiff data found"
 end
-
-# MakeItRight.patch_jif ARGV.first, "result.jpg" do |tags|
-#  puts "Input tags:"
-#  pp tags.all
-#  # We can edit the tags if we feel like it
-# end
