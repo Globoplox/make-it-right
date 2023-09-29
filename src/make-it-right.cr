@@ -48,13 +48,12 @@ module MakeItRight
         components: #{@components}
         value: 0x#{@value.to_s 16}
         raw_data: #{@raw.try { |raw| "0x#{raw.map(&.to_s 16).join}" } || "none"}
-
+        cause: #{@cause.try(&.message) || "none"}
       STR
     end
   end
 
   enum Orientation
-    UNKNOWN      = 0
     TOP_LEFT     = 1
     TOP_RIGHT    = 2
     BOTTOM_RIGHT = 3
@@ -66,7 +65,6 @@ module MakeItRight
   end
 
   enum Unit
-    UNKNOWN    = 0
     NONE       = 1
     INCH       = 2
     CENTIMETER = 3
@@ -81,7 +79,6 @@ module MakeItRight
   end
 
   enum ExposureProgram
-    UNKNOWN           = 0
     MANUAL            = 1
     NORMAL            = 2
     APERTURE_PRIORITY = 3
@@ -93,7 +90,6 @@ module MakeItRight
   end
 
   enum MeteringMode
-    UNKNOWN                 =   0
     AVERAGE                 =   1
     CENTER_WEIGHTED_AVERAGE =   2
     SPOT                    =   3
@@ -104,7 +100,6 @@ module MakeItRight
   end
 
   enum LightSource
-    UNKNOWN          =   0
     DAYLIGHT         =   1
     FLUORESCENT      =   2
     TUNGSTEN         =   3
@@ -161,16 +156,27 @@ module MakeItRight
       @functionality = FlashFunctionality.from_value value >> 5 & 0b1
       @red_eye = RedEyeReduction.from_value value >> 6 & 0b1
     end
+
+    def to_s(io)
+      io << "fired: "
+      fired.to_s io
+      io << "; strobe: "
+      strobe.to_s io
+      io << "; mode: "
+      mode.to_s io
+      io << "; functionality: "
+      functionality.to_s io
+      io << "; red_eye: "
+      red_eye.to_s io
+    end
   end
 
   enum ColorSpace
-    UNKNOWN      =     0
     SRGB         =     1
     UNCALIBRATED = 65535
   end
 
   enum SensingMethod
-    INVALID                 = 0
     UNDEFINED               = 1
     ONE_CHIP_COLOR_AREA     = 2
     TWO_CHIP_COLOR_AREA     = 3
@@ -181,7 +187,6 @@ module MakeItRight
   end
 
   enum Compression
-    UNKNOWN       =     0
     NONE          =     1
     CCITTRLE      =     2
     CCITTFAX3     =     3
@@ -209,7 +214,6 @@ module MakeItRight
   end
 
   enum PhotometricInterpretation
-    UNKNOWN    = 0
     MONOCHROME = 1
     RGB        = 2
     YCBCR      = 6
@@ -260,7 +264,6 @@ module MakeItRight
   end
 
   enum DistanceRange
-    UNKNOWN = 0
     MACRO   = 1
     CLOSE   = 2
     DISTANT = 3
@@ -294,7 +297,7 @@ module MakeItRight
         UNDEFINED,
       }.find &.== value[0...8]
       raise Exception.new "Encoding unrecognized #{value[0, 8]}" unless encoding
-      new encoding, String.new value[8...(value.size - 1)]
+      new encoding, String.new value[8...(value.size - 1)][0...(value.index 0u8)]
     end
 
     property encoding : Bytes
@@ -362,62 +365,6 @@ module MakeItRight
     File.open path do |io|
       Tiff.new io.getb_to_end
     end
-  end
-
-  # Extract tags from a TIFF file
-  # UNUSZD
-  def self.from_tiff(io : IO) : MainImageIfd
-    start_at = io.pos
-    # Parse TIFF header
-    case io.read_bytes UInt16, IO::ByteFormat::BigEndian
-    when 0x4d4d then alignement = IO::ByteFormat::BigEndian
-    when 0x4949 then alignement = IO::ByteFormat::LittleEndian
-    else             raise Exception.new "Bad alignment entry in TIFF header"
-    end
-    magic = io.read_bytes UInt16, alignement
-    raise Exception.new "Bad magic entry in TIFF header: 0x#{magic.to_s 16}" unless 0x002a == magic
-    offset = io.read_bytes UInt32, alignement
-    io.pos = start_at + offset
-
-    # Parse IFD according to filters
-    main_image_ifd = MainImageIfd.new io, start_at, alignement
-
-    main_image_ifd.tags[0x8769]?.try do |exif_offset|
-      io.pos = start_at + exif_offset[:value]
-      exif = main_image_ifd.exif = ExifIfd.new io, start_at, alignement
-
-      exif.tags[0xa005]?.try do |interop_offset|
-        io.pos = start_at + interop_offset[:value]
-        exif.interoperability = InteroperabilityIfd.new io, start_at, alignement
-      end
-    end
-
-    if (offset_to_next = main_image_ifd.offset_to_next) != 0
-      io.pos = start_at + offset_to_next
-      thumbnail_ifd = ThumbnailIfd.new io, start_at, alignement
-      main_image_ifd.thumbnail = thumbnail_ifd
-
-      data_offset = thumbnail_ifd.tags[0x0201]?.try &.[:value]
-      data_size = thumbnail_ifd.tags[0x0202]?.try &.[:value]
-      if data_offset && data_size && data_offset != 0 && data_size > 0
-        data = Bytes.new data_size
-        io.pos = start_at + data_offset
-        io.read data
-        thumbnail_ifd.data = data
-      end
-
-      thumbnail_ifd.tags[0xa005]?.try do |interop_offset|
-        io.pos = start_at + interop_offset[:value]
-        thumbnail_ifd.interoperability = InteroperabilityIfd.new io, start_at, alignement
-      end
-    end
-
-    main_image_ifd.try &.tags[0x8825]?.try do |gps_offset|
-      io.pos = start_at + gps_offset[:value]
-      main_image_ifd.gps = GpsIfd.new io, start_at, alignement
-    end
-
-    main_image_ifd
   end
 
   # Thing to think about:
@@ -641,9 +588,11 @@ module MakeItRight
           {% else %}
             {% type = type.resolve %}
             {% if type.resolve < Enum %}
-              value = get_u16({{tag}}).try { |value| {{type}}.from_value value }
-            {% elsif type.id == Ifd.id %}
-              value = get_subifd {{tag}}
+              value = get_enum {{type}}, {{tag}}
+            {% elsif type <= Ifd %}
+              value = get_subifd {{type}}, {{tag}}
+            {% elsif type.id == Time.id %}
+              value = get_time {{tag}}
             {% elsif type.id == Bytes.id %}
               value = get_bytes {{tag}}
             {% elsif type.id == String.id %}
@@ -690,21 +639,38 @@ module MakeItRight
           nil
         end
       {% end %}
-      
-    
 
       def all
-        summary = Hash(String, Summary).new initial_capacity: {{tags.size}}
+        summary = Hash(String, Summary).new initial_capacity: {{tags.size}} + 1
         {% for entry in tags %}
           {% name = entry[0] %}
+          {% tag = entry[1] %}
           {% type = entry[2] %}
-          {% if type.is_a? Path && type.resolve.id == Ifd.id %}
-            summary["{{name.id}}"] = {{name.id.underscore}}.try(&.all)
-          {% else %}
-            summary["{{name.id}}"] = {{name.id.underscore}}.try(&.to_s)
-          {% end %}
+          if @tags.has_key? {{tag}}
+            {% if type.is_a? Path && type.resolve <= Ifd %}
+              value = {{name.id.underscore}}.try(&.all)
+            {% else %}
+              value = {{name.id.underscore}}.try(&.to_s)
+            {% end %}
+            summary["{{name.id}}"] = value if value
+          end
         {% end %}
+        next_ifd = self.next
+        summary["next"] = next_ifd.all if next_ifd
         summary
+      end
+
+      def subifds
+        ([
+          self.next,
+          {% for entry in tags %}
+          {% name = entry[0] %}
+          {% type = entry[2] %}
+          {% if type.is_a? Path && type.resolve <= Ifd %}
+            {{name}},
+          {% end %}
+          {% end %}
+        ] of Ifd?).compact
       end
 
       KNOWN_TAGS = {{tags.map(&.[1])}}
@@ -714,15 +680,30 @@ module MakeItRight
       end
     end
 
-    def get_subifd(tag : UInt16) : Ifd?
+    protected def get_enum(type : T.class, tag : UInt16) : T? forall T
+      get_u16(tag).try do |value|
+        type.from_value value
+      rescue ex
+        @errors << ex unless value == 0u16
+        return
+      end
+    end
+
+    protected def get_time(tag : UInt16) : Time?
+      get_string(tag).try do |value|
+        /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC
+      end
+    end
+
+    protected def get_subifd(type, tag : UInt16) : Ifd?
       entry = @tags[tag]?
       return unless entry
-      Ifd.new @tiff, entry[:value]
+      type.new @tiff, entry[:value]
     end
 
     # Support UInt16, UInt32, Array(UInt16) as they are the necessary ones
     # but it can be easely extended
-    def get_union(tag : UInt16, union_type : T.class) forall T
+    protected def get_union(tag : UInt16, union_type : T.class) forall T
       entry = @tags[tag]?
       return unless entry
       case {entry[:format], entry[:components]}
@@ -741,28 +722,28 @@ module MakeItRight
       value.as(T)
     end
 
-    def get_u16(tag : UInt16) : UInt16?
+    protected def get_u16(tag : UInt16) : UInt16?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 3 && entry[:components] == 1
       (entry[:value] >> 16).to_u16!
     end
 
-    def get_u8(tag : UInt16) : UInt8?
+    protected def get_u8(tag : UInt16) : UInt8?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as UInt8" unless entry[:format] == 1 && entry[:components] == 1
       (entry[:value] >> 24).to_u8!
     end
 
-    def get_u32(tag : UInt16) : UInt32?
+    protected def get_u32(tag : UInt16) : UInt32?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 4 && entry[:components] == 1
       entry[:value]
     end
 
-    def get_ur(tag : UInt16) : Rational(UInt32)?
+    protected def get_ur(tag : UInt16) : Rational(UInt32)?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as Rational(UInt32)" unless entry[:format] == 5 && entry[:components] == 1
@@ -775,20 +756,20 @@ module MakeItRight
       end
     end
 
-    def get_r(tag : UInt16) : Rational(Int32)?
+    protected def get_r(tag : UInt16) : Rational(Int32)?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as Rational(Int32)" unless entry[:format] == 10 && entry[:components] == 1
       entry[:raw]?.try do |bytes|
         io = IO::Memory.new bytes
         Rational(Int32).new(
-          io.read_bytes(Int32, @alignement),
-          io.read_bytes(Int32, @alignement)
+          io.read_bytes(Int32, @tiff.alignement),
+          io.read_bytes(Int32, @tiff.alignement)
         )
       end
     end
 
-    def get_aur(tag : UInt16) : Array(Rational(UInt32))?
+    protected def get_aur(tag : UInt16) : Array(Rational(UInt32))?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as Array(Rational(Int32))" unless entry[:format] == 5
@@ -803,7 +784,7 @@ module MakeItRight
       end
     end
 
-    def get_au16(tag : UInt16) : Array(UInt16)?
+    protected def get_au16(tag : UInt16) : Array(UInt16)?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as Array(UInt16)" unless entry[:format] == 3
@@ -824,7 +805,7 @@ module MakeItRight
       end
     end
 
-    def get_au32(tag : UInt16) : Array(UInt32)?
+    protected def get_au32(tag : UInt16) : Array(UInt32)?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as Array(UInt32)" unless entry[:format] == 4
@@ -842,7 +823,7 @@ module MakeItRight
       end
     end
 
-    def get_aui(tag : UInt16) : Array(UInt16 | UInt32)?
+    protected def get_aui(tag : UInt16) : Array(UInt16 | UInt32)?
       entry = @tags[tag]?
       return unless entry
       case entry[:format]
@@ -852,7 +833,7 @@ module MakeItRight
       end
     end
 
-    def get_bytes(tag : UInt16) : Bytes?
+    protected def get_bytes(tag : UInt16) : Bytes?
       entry = @tags[tag]?
       return unless entry
       if entry[:components] <= 4
@@ -866,7 +847,7 @@ module MakeItRight
       end
     end
 
-    def get_string(tag : UInt16) : String?
+    protected def get_string(tag : UInt16) : String?
       entry = @tags[tag]?
       return unless entry
       raise Exception.new "This tag is not registered as ASCII/Unicode" unless entry[:format] == 2
@@ -878,20 +859,39 @@ module MakeItRight
         String.new raw
       else
         entry[:raw].try do |raw|
-          String.new raw[0, raw.size - 1]
+          String.new raw[0...(raw.index 0u8)]
         end
       end
+    end
+
+    def next : Ifd?
+      @offset_to_next != 0 ? Ifd.new(@tiff, @offset_to_next) : nil
     end
 
     protected getter tags
     getter errors = [] of ::Exception
     @offset_to_next : UInt32
 
+    def all_errors
+      subifds.reduce @errors do |errors, ifd|
+        errors + ifd.all_errors
+      end
+    end
+
+    def all_unknown_tags
+      subifds.reduce unknown_tags do |unknown_tags, ifd|
+        unknown_tags.merge ifd.all_unknown_tags
+      end
+    end
+
     def initialize(@tiff : Tiff, @offset : UInt32)
       io = @tiff.io
       alignement = @tiff.alignement
+      buffer = @tiff.buffer
+      io.pos = @offset
       entries_count = io.read_bytes UInt16, alignement
       @tags = Hash(UInt16, {format: UInt16, components: UInt32, value: UInt32, raw: Bytes?}).new initial_capacity: entries_count
+      data_size = 0u32
       (0...entries_count).each do
         tag = io.read_bytes UInt16, alignement
         format = io.read_bytes UInt16, alignement
@@ -910,7 +910,9 @@ module MakeItRight
           next
         elsif byte_per_components * components_amount > 4
           # slice from tiff buffer instead (also no need to copy value later)
-          bytes = Bytes.new byte_per_components * components_amount
+          bytes = buffer[value_or_offset, byte_per_components * components_amount]
+          data_size += byte_per_components * components_amount
+          data_size += 1 if data_size.odd?
         end
 
         @tags[tag] = {
@@ -921,14 +923,7 @@ module MakeItRight
         }
       end
       @offset_to_next = io.read_bytes UInt32, alignement
-
-      # Copy the raw value data for selected tags whose values is an offset to raw data
-      @tags.values.each do |entry|
-        if bytes = entry[:raw]
-          io.pos = entry[:value]
-          io.read bytes
-        end
-      end
+      io.skip data_size
     end
 
     # *tiff_start_at* is the offset to TIFF relative to IO
@@ -1002,7 +997,7 @@ module MakeItRight
     end
   end
 
-  class InteroperabilityIfd < Ifd
+  class Interoperability < Ifd
     register_tags [
       {index, 0x0001, Bytes, nil},
       {version, 0x0002, Bytes, nil},
@@ -1010,201 +1005,17 @@ module MakeItRight
       {related_image_width, 0x1001, UInt16 | UInt32, nil},
       {related_image_height, 0x1002, UInt16 | UInt32, nil},
     ]
-
-    def all_errors
-      errors
-    end
-
-    def all_unknown
-      unknown_tags unless unknown_tags.empty?
-    end
   end
 
-  class ExifIfd < Ifd
-    property interoperability : InteroperabilityIfd?
-
-    def all_errors
-      @errors +
-        (interoperability.try(&.all_errors) || [] of Exception)
-    end
-
-    register_tags [
-      {exposure_time, 0x829a, Rational(UInt32), nil},
-      {f_number, 0x829d, Rational(UInt32), nil},
-      {exposure_program, 0x8822, ExposureProgram, nil},
-      {iso_speed_ratings, 0x8827, Array(UInt16), nil},
-      {oecf, 0x8828, Bytes, nil},                                            # Could be parsed
-      {exif_version, 0x9000, Bytes, ->(value : Bytes) { String.new value }}, # not String because it has no null terminator
-      {date_time_original, 0x9003, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
-      {date_time_digitized, 0x9004, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
-      {components_configuration, 0x9101, Bytes, nil}, # maybe parse it,
-      {compressed_bits_per_pixel, 0x9102, Rational(UInt32), nil},
-      {shutter_speed_value, 0x9201, Rational(Int32), nil},
-      {aperture_value, 0x9202, Rational(UInt32), nil},
-      {brightness_value, 0x9203, Rational(Int32), nil},
-      {exposure_bias_value, 0x9204, Rational(Int32), nil},
-      {max_aperture_value, 0x9205, Rational(UInt32), nil},
-      {subject_distance, 0x9206, Rational(Int32), nil}, # meter. maybe add optional unit to rational ?
-      {metering_mode, 0x9207, MeteringMode, nil},
-      {light_source, 0x9208, LightSource, nil},
-      {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.new value }},
-      {focal_length, 0x920a, Rational(UInt32), nil},
-      {maker_note, 0x927c, Bytes, nil},
-      {user_comment, 0x9286, Bytes, ->(value : Bytes) { UserComment.from_value value }},
-      {subsec_time, 0x9290, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
-      {subsec_time_original, 0x9291, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
-      {subsec_time_digitized, 0x9292, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
-      {flash_pix_version, 0xa000, Bytes, ->(value : Bytes) { String.new value }}, # No null terminator
-      {color_space, 0xa001, ColorSpace, nil},
-      {exif_image_width, 0xa002, UInt16 | UInt32 | Array(UInt16), nil},
-      {exif_image_height, 0xa003, UInt16 | UInt32 | Array(UInt16), nil},
-      {related_sound_file, 0xa004, String, nil},
-      {flash_energy, 0xa20b, Rational(Int32), nil},
-      {interoperability_offset, 0xa005, self, ->(value : self) { value.interoperability.try(&.all) }},
-      {focal_plane_x_resolution, 0xa20e, Rational(UInt32), nil},
-      {focal_plane_y_resolution, 0xa20f, Rational(UInt32), nil},
-      {focal_plane_resolution_unit, 0xa210, Unit, nil},
-      {exposure_index, 0xa215, Rational(UInt32), nil}, # See iso_speed_rating, same format but unsigned. Historical error.
-      {sensing_method, 0xa217, SensingMethod, nil},
-      {file_source, 0xa300, Bytes, nil},
-      {scene_type, 0xa301, Bytes, nil},
-      {cfa_pattern, 0xa302, Bytes, nil},
-      {custom_rendered, 0xa401, UInt16, ->(value : UInt16) { value != 0 }},
-      {exposure_mode, 0xa402, ExposureMode, nil},
-      {white_balance, 0xa403, WhiteBalance, nil},
-      {digital_zoom_ratio, 0xa404, Rational(UInt32), nil},
-      {focal_length_in_35mm_film, 0xa405, UInt16, nil},
-      {scene_capture_type, 0xa406, SceneType, nil},
-      {gain_control, 0xa407, GainControl, nil},
-      {contrast, 0xa408, Contrast, nil},
-      {saturation, 0xa409, Saturation, nil},
-      {sharpness, 0xa40a, Sharpness, nil},
-      {device_setting_description, 0xa40b, Bytes, nil},
-      {subject_distance_range, 0xa40c, DistanceRange, nil},
-      {image_uid, 0xa420, String, nil},
-      {subject_area, 0x9214, Array(UInt16), nil},
-      {sensitivity_type, 0x8830, UInt16, nil}, # I dont know how to interpret it
-      {camera_owner_name, 0xa430, String, nil},
-      {lens_specifications, 0xa432, Array(Rational(UInt32)), nil},
-      {lens_make, 0xa433, String, nil},
-      {lens_model, 0xa434, String, nil},
-      {lens_serial_number, 0xa435, String, nil},
-      {offset_time, 0x9010, String, nil},
-      {offset_time_original, 0x9011, String, nil},
-      {offset_time_digitized, 0x9012, String, nil},
-      {body_serial_number, 0xa431, String, nil},
-      # That one is fun, it's an attempt by microsoft to fix maker note that ended being another
-      # issue on its own. It probably make no sense.
-      {offset_schema, 0xea1d, UInt32, nil},
-    ]
-
-    def all_unknown
-      u_tags = unknown_tags.empty? ? nil : unknown_tags
-      u_interoperability = interoperability.try &.all_unknown
-      {
-        "tags"             => u_tags,
-        "interoperability" => u_interoperability,
-      } if u_tags || u_interoperability
-    end
-  end
-
-  class ThumbnailIfd < Ifd
-    property interoperability : InteroperabilityIfd?
-    property data : Bytes?
-
-    def all_errors
-      @errors +
-        (interoperability.try(&.all_errors) || [] of Exception)
-    end
-
-    register_tags [
-      {image_width, 0x0100, UInt16 | UInt32, nil},
-      {image_height, 0x0101, UInt16 | UInt32, nil},
-      {bit_per_sample, 0x0102, Array(UInt16), nil},
-      {compression, 0x0103, Compression, nil},
-      {photometric_interpretation, 0x0106, PhotometricInterpretation, nil},
-      {strip_offsets, 0x0111, Array(UInt16 | UInt32), nil},
-      {orientation, 0x0112, Orientation, nil},
-      {samples_per_pixel, 0x0115, UInt16, nil},
-      {row_per_strip, 0x0116, UInt16, nil},
-      {strip_byte_count, 0x0117, UInt16 | UInt32, nil},
-      {x_resolution, 0x011a, Rational(UInt32), nil},
-      {y_resolution, 0x011b, Rational(UInt32), nil},
-      {planar_configuration, 0x011c, UInt16, nil},                                         # Interpretation vary
-      {resolution_unit, 0x0128, UInt16, ->(value : UInt16) { Unit.from_thumbnail value }}, # Not the same value as other
-      {jpeg_if_offset, 0x0201, UInt32, nil},
-      {jpeg_if_byte_count, 0x0202, UInt32, nil},
-      {ycbcr_coefficients, 0x0211, Array(Rational(UInt32)), nil},
-      {ycbcr_sub_sampling, 0x0212, Array(UInt16), nil},
-      {ycbcr_positioning, 0x0213, UInt16, nil},
-      {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
-      # Sony put those for thumbnail too:
-      {make, 0x010f, String, nil},
-      {model, 0x0110, String, nil},
-      {date_time, 0x0132, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
-    ]
-
-    def all_unknown
-      u_tags = unknown_tags.empty? ? nil : unknown_tags
-      u_interoperability = interoperability.try &.all_unknown
-      {
-        "tags"             => u_tags,
-        "interoperability" => u_interoperability,
-      } if u_tags || u_interoperability
-    end
-  end
-
+  # Regroup tags from Image, Thumbnail, Photo & GPS as there should be no collision.
+  # AKA (IFD0, IFD1, SUBIFD, GPSIFD)
+  # It is more practical than splitting them because
+  # a lot of picture have those tags in the wrong IFD.
+  # Interoperability is kept separated because it collide with GPS and it rarely mix up with other ifd
   class Ifd
     register_tags [
-      {orientation, 0x0112, Orientation, nil},
-      {description, 0x010e, String, nil},
-      {make, 0x010f, String, nil},
-      {model, 0x0110, String, nil},
-      {artist, 0x013b, String, nil},
-      {x_resolution, 0x011a, Rational(UInt32), nil},
-      {y_resolution, 0x011b, Rational(UInt32), nil},
-      {x_resolution_unit, 0x0128, Unit, nil},
-      {software, 0x0131, String, nil},
-      {date_time, 0x0132, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
-      {white_point, 0x013e, Array(Rational(UInt32)), nil},
-      {primary_chromacities, 0x013f, Array(Rational(UInt32)), nil},
-      {ycbcr_coefficients, 0x0211, Array(Rational(UInt32)), nil},
-      {ycbcr_positioning, 0x0213, UInt16, nil},
-      {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
-      {copyright, 0x8298, String, nil},
-      {exif, 0x8769, Ifd, nil},
-      {gps, 0x8825, Ifd, nil},
-      {print_image_matching, 0xc4a5, Bytes, nil}, # No more info
-      {gamma, 0xa500, Rational(UInt32), nil},
-      # WINDOWS XP SHITYARD
-      {title, 0x9c9b, String, nil},
-      {comment, 0x9c9c, String, nil},
-      {author, 0x9c9d, String, nil},
-      {keywords, 0x9c9e, String, nil},
-      {subject, 0x9c9f, String, nil},
-      # Those should be in the EXIF ifd but sometimes they are here
-      {custom_rendered, 0xa401, UInt16, ->(value : UInt16) { value != 0 }},
-      {exposure_mode, 0xa402, ExposureMode, nil},
-      {white_balance, 0xa403, WhiteBalance, nil},
-      {scene_capture_type, 0xa406, SceneType, nil},
-      {contrast, 0xa408, Contrast, nil},
-      {saturation, 0xa409, Saturation, nil},
-      {sharpness, 0xa40a, Sharpness, nil},
-      {subject_distance_range, 0xa40c, DistanceRange, nil},
-      {digital_zoom_ratio, 0xa404, Rational(UInt32), nil},
-      {focal_length_in_35mm_film, 0xa405, UInt16, nil},
-      {gain_control, 0xa407, GainControl, nil},
-
-      # These should be in interoperability, but sometimes they are not
-      {related_image_width, 0x1001, UInt16 | UInt32, nil},
-      {related_image_height, 0x1002, UInt16 | UInt32, nil},
-
-    ]
-  end
-
-  class GpsIfd < Ifd
-    register_tags [
-      {gps_version, 0x0000, Bytes, ->(value : Bytes) { String.new value }},
+      # GPS
+      {gps_version, 0x0000, Bytes, nil},
       {latitude_ref, 0x0001, String, nil},
       {latitude, 0x0002, Array(Rational(UInt32)), nil},
       {longitude_ref, 0x0003, String, nil},
@@ -1236,37 +1047,115 @@ module MakeItRight
       {date_stamp, 0x001d, String, nil},
       {differential, 0x001e, UInt16, nil},
       {positioning_error, 0x001f, Rational(UInt32), nil},
-      # Tags that belongs to other IFD but there pics in the wild with those in gps
+
+      # Image IFD
+      {image_width, 0x0100, UInt16 | UInt32, nil},
+      {image_height, 0x0101, UInt16 | UInt32, nil},
+      {bit_per_sample, 0x0102, Array(UInt16), nil},
+      {compression, 0x0103, Compression, nil},
+      {photometric_interpretation, 0x0106, PhotometricInterpretation, nil},
+      {description, 0x010e, String, nil},
+      {make, 0x010f, String, nil},
+      {model, 0x0110, String, nil},
+      {strip_offsets, 0x0111, Array(UInt16 | UInt32), nil},
+      {orientation, 0x0112, Orientation, nil},
+      {samples_per_pixel, 0x0115, UInt16, nil},
+      {row_per_strip, 0x0116, UInt16, nil},
+      {strip_byte_count, 0x0117, UInt16 | UInt32, nil},
+      {x_resolution, 0x011a, Rational(UInt32), nil},
+      {y_resolution, 0x011b, Rational(UInt32), nil},
+      {planar_configuration, 0x011c, UInt16, nil}, # Interpretation vary
+      {resolution_unit, 0x0128, Unit, nil},
+      {software, 0x0131, String, nil},
+      {date_time, 0x0132, Time, nil},
+      {artist, 0x013b, String, nil},
+      {white_point, 0x013e, Array(Rational(UInt32)), nil},
+      {primary_chromacities, 0x013f, Array(Rational(UInt32)), nil},
+      {jpeg_if_offset, 0x0201, UInt32, nil},
+      {jpeg_if_byte_count, 0x0202, UInt32, nil},
+      {ycbcr_coefficients, 0x0211, Array(Rational(UInt32)), nil},
+      {ycbcr_sub_sampling, 0x0212, Array(UInt16), nil},
+      {ycbcr_positioning, 0x0213, UInt16, nil},
+      {reference_black_white, 0x0214, Array(Rational(UInt32)), nil},
+      {copyright, 0x8298, String, nil},
+      {exif, 0x8769, Ifd, nil},
+      {gps, 0x8825, Ifd, nil},
+      {print_image_matching, 0xc4a5, Bytes, nil}, # No more info
+      # Windows
+      {title, 0x9c9b, String, nil},
+      {comment, 0x9c9c, String, nil},
+      {author, 0x9c9d, String, nil},
+      {keywords, 0x9c9e, String, nil},
+      {subject, 0x9c9f, String, nil},
+
+      # EXIF
       {exposure_time, 0x829a, Rational(UInt32), nil},
       {f_number, 0x829d, Rational(UInt32), nil},
       {exposure_program, 0x8822, ExposureProgram, nil},
-      {exif_version, 0x9000, Bytes, ->(value : Bytes) { String.new value }}, # not String because it has no null terminator
-      {date_time_original, 0x9003, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
-      {date_time_digitized, 0x9004, String, ->(value : String) { /^\s*$/ =~ value ? nil : Time.parse value, "%Y:%m:%d %H:%M:%S", Time::Location::UTC }},
+      {iso_speed_ratings, 0x8827, Array(UInt16), nil},
+      {oecf, 0x8828, Bytes, nil},         # Could be parsed
+      {exif_version, 0x9000, Bytes, nil}, # not String because it has no null terminator
+      {date_time_original, 0x9003, Time, nil},
+      {date_time_digitized, 0x9004, Time, nil},
       {components_configuration, 0x9101, Bytes, nil}, # maybe parse it,
+      {compressed_bits_per_pixel, 0x9102, Rational(UInt32), nil},
+      {shutter_speed_value, 0x9201, Rational(Int32), nil},
+      {aperture_value, 0x9202, Rational(UInt32), nil},
+      {brightness_value, 0x9203, Rational(Int32), nil},
+      {exposure_bias_value, 0x9204, Rational(Int32), nil},
+      {max_aperture_value, 0x9205, Rational(UInt32), nil},
+      {subject_distance, 0x9206, Rational(Int32), nil}, # meter. maybe add optional unit to rational ?
+      {metering_mode, 0x9207, MeteringMode, nil},
+      {light_source, 0x9208, LightSource, nil},
       {flash, 0x9209, UInt16, ->(value : UInt16) { Flash.new value }},
       {focal_length, 0x920a, Rational(UInt32), nil},
-      # This one is gonna make me SO MAD FFS WHY THE FUCK IS IT IN GPS
-      {maker_note_offset, 0x927c, self, ->(value : self) { nil }},
-      {flash_pix_version, 0xa000, Bytes, ->(value : Bytes) { String.new value }}, # No null terminator
+      {maker_note, 0x927c, Bytes, nil},
+      {user_comment, 0x9286, Bytes, ->(value : Bytes) { UserComment.from_value value }},
+      {subsec_time, 0x9290, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
+      {subsec_time_original, 0x9291, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
+      {subsec_time_digitized, 0x9292, String, ->(v : String) { v.chars.all?(&.== Char::ZERO) ? nil : v.to_i.milliseconds }},
+      {flash_pix_version, 0xa000, Bytes, nil}, # No null terminator
       {color_space, 0xa001, ColorSpace, nil},
       {exif_image_width, 0xa002, UInt16 | UInt32 | Array(UInt16), nil},
       {exif_image_height, 0xa003, UInt16 | UInt32 | Array(UInt16), nil},
       {related_sound_file, 0xa004, String, nil},
-      # THIS ONE TOO
-      {interoperability_offset, 0xa005, self, ->(value : self) { nil }},
-      # Ok so I am gonna have to do a generic ifd shit stuff i guess ?
-
+      {flash_energy, 0xa20b, Rational(Int32), nil},
+      {interoperability, 0xa005, Interoperability, nil},
+      {focal_plane_x_resolution, 0xa20e, Rational(UInt32), nil},
+      {focal_plane_y_resolution, 0xa20f, Rational(UInt32), nil},
+      {focal_plane_resolution_unit, 0xa210, Unit, nil},
+      {exposure_index, 0xa215, Rational(UInt32), nil}, # See iso_speed_rating, same format but unsigned. Historical error.
+      {sensing_method, 0xa217, SensingMethod, nil},
+      {file_source, 0xa300, Bytes, nil},
+      {scene_type, 0xa301, Bytes, nil},
+      {cfa_pattern, 0xa302, Bytes, nil},
+      {custom_rendered, 0xa401, UInt16, ->(value : UInt16) { value != 0 }},
+      {exposure_mode, 0xa402, ExposureMode, nil},
+      {white_balance, 0xa403, WhiteBalance, nil},
+      {digital_zoom_ratio, 0xa404, Rational(UInt32), nil},
+      {focal_length_in_35mm_film, 0xa405, UInt16, nil},
+      {scene_capture_type, 0xa406, SceneType, nil},
+      {gain_control, 0xa407, GainControl, nil},
+      {contrast, 0xa408, Contrast, nil},
+      {saturation, 0xa409, Saturation, nil},
+      {sharpness, 0xa40a, Sharpness, nil},
+      {gamma, 0xa500, Rational(UInt32), nil},
+      {device_setting_description, 0xa40b, Bytes, nil},
+      {subject_distance_range, 0xa40c, DistanceRange, nil},
+      {image_uid, 0xa420, String, nil},
+      {subject_area, 0x9214, Array(UInt16), nil},
+      {sensitivity_type, 0x8830, UInt16, nil}, # I dont know how to interpret it
+      {camera_owner_name, 0xa430, String, nil},
+      {lens_specifications, 0xa432, Array(Rational(UInt32)), nil},
+      {lens_make, 0xa433, String, nil},
+      {lens_model, 0xa434, String, nil},
+      {lens_serial_number, 0xa435, String, nil},
+      {offset_time, 0x9010, String, nil},
+      {offset_time_original, 0x9011, String, nil},
+      {offset_time_digitized, 0x9012, String, nil},
+      {body_serial_number, 0xa431, String, nil},
+      {offset_schema, 0xea1d, UInt32, nil},
     ]
-
-    # override all_errors and all_unknowns if we add more subifd
-    def all_errors
-      errors
-    end
-
-    def all_unknown
-      unknown_tags unless unknown_tags.empty?
-    end
   end
 
   class Tiff < Ifd
@@ -1298,6 +1187,15 @@ tiff = MakeItRight.from_jif ARGV.first
 if tiff
   puts "All the tags:"
   pp tiff.all
+  puts
+  puts "All the unknown tags:"
+  pp tiff.all_unknown_tags
+  puts
+  puts "All errors:"
+  pp tiff.all_errors
+  puts
+  pp tiff.subifds.size
+  pp tiff.subifds.map(&.subifds.size)
 else
   puts "No tiff data found"
 end
