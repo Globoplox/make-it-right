@@ -1,46 +1,24 @@
 # make-it-right
 
-Important todo/note to myself:
+A pure crystal, zero dependencies EXIF parsing lib. It will be less accurate than tool or binding based on libexif, however it might be easier to use for simple cases.
 
-- There might be TWO APP1 (one for EXIF, one for XMP)
+It is tested with [exiftool](https://exiftool.org/) and [exif-samples](https://github.com/ianare/exif-samples.git).
 
-- Allow to store original IO offset of tag entry for in place editing
-- Remove filters
-- Remove the close? param and just buffer all and rewrap into an IO.
-- Make sub IFD regular lazy value (Have to handle both 'offset' and 'bytes' flavor)
-  - Including the offset IFD (will need to have a specialized accessor)
-- Maybe allow, for some tags, to cache the value (usefull if complex, like sub IFD)
-- If we parse the IFD from a buffer instead of an IO, we can reduce allocation by slicing the original slice
-  instead of copying it.
-  We could actually have both parameter (io/slice) passed or, if slice, wrap io, if io only, dup when slicing.
-- Maybe merge all the tags within a single IFD type.
-- Ifd#all clear nil tags. Maybe even it should run only for tags present in @tags to avoid useless checks
+It support reading and writing TIFF/EXIF data embedded into JIF (jpg) files.  
+It does not support maker notes. It will attempt to write back maker notes when serializing, but it:
 
-A pure crystal, zero dependencies EXIF parsing lib.
-It will be much less accurate than tool or binding based on exisiting libs (libexif and exiv2).
-But it might be less of a pity for simplest needs. Exiv2 is c++ so binding are annoying. There are bindings for libexif available that are surely much better than this if you mostly wish to display the data.
-If you just want that damned orientation tag, this lib will be more than enough.
-This lib also attempt to produce programmatically practical values rather than purely visual ones.
+- Will NOT write maker note at the same offset that they were read from
+- Will NOT correct offset included into maker notes if the maker notes block moved
+- WIll NOT parse or write back any maker note data that are not included within the data block whose size and offset are indicated by the makre note tag.
 
-## Accuracy, testing
-
-Im still working on it but I am using pictures from the exif-sample repository and comparing to exiftool to ensure, as much as possible:
-
-- I detect all the tags (not yet, there are oddities (subifd where there should not, and maker_note))
-- I know all the tags (All the one I detect at least lol)
-- I successfully parse all the tags
-- I can read then write to the same jpeg and produce an
-  image identical to the source (when possible, there might be ordering that change, but it should be valid)
-- In the future, i will have to test that writing tags work correctly
-
-## Rapid overview of exif and related for the people that wish they weren't here (like me) SKIP if you already KnowTheThings™
+## Quick overview of EXIF
 
 JPEG is a compression method for image.
 JIF is a file format for storing JPEG compressed image.
 JFIF is an extension of JIF that add metadata to JIF.
 TIFF is a file format for storing various things along with metadata.
 EXIF is a specification for storing metadata.
-When talking about EXIF in images, usually it means having a regular JIF of JFIF file with an additional TIFF file, itself including EXIF metadata.
+When talking about EXIF in images, usually it means having a JIF file with an additional TIFF file embbed, itself including EXIF metadata.
 
 Tags are TIFF/EXIF key/value metadata
 IFD are a group of related tags. IFD can have sub-IFD.
@@ -52,149 +30,71 @@ The important IFD an image can have:
   - A Maker Note IFD containing details specific to the manufacturer of the camera that crated the file
 - A thumbnail IFD, containing details about the thumbnail image if there is one
 
-Now the main issue about EXIF/TIFF is that it is usually poorly implemented and often tags or even IFD are not where the IFD they should, have aberrant values, or even out of spec types.
-Most of the time the EXIF/TIFF metadata are completely irrelevant, but some infamous metadata tags can affect how the picture will be displayed in some tools, which force everyone else to care about this.
-
 ## Usage
 
-Extract tags from a JPEG picture:
-
 ```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg"
-unless tags
-  puts "no tags data found"
-end
-```
 
-You can also open TIFF file with `#from_tiff`
+puts "Opening picture #{ARGV.first}"
+tiff = MakeItRight.from_jif ARGV.first
+unless tiff
+  puts "Picture #{ARGV.first} does not contains a TIFF/EXIF block, creating one."
+  tiff = MakeItRight::Tiff.new
 
-Extract tags from the payload of an APP1 block of a JIF (.jpg) file that you are parsing by your own means:
-
-```cr
-tags = MakeItRight.from_exif io_jif_app1_payload_without_marker_and_size
-```
-
-Access a particular subcategory (ifd) of tags:
-
-```cr
-MakeItRight.from_jif("path/to/picture.jpg").try do |image|
-  puts "Image tags are presents"
-
-  image.thumbnail.try do |thumbnail|
-    puts "Thumbnail tags are presents"
-
-    thumbnail.interoperability.try do |interoperability|
-      puts "Thumbnail interoperability tags are presents"
-    end
-
-  end
-
-  image.exif.try do |exif|
-    puts "Exif tags are presents"
-
-    exif.interoperability.try do |interoperability|
-      puts "Exif interoperability tags are presents"
-    end
-
-    exif.maker_note.try do |maker_note|
-      puts "Exif maker_note tags are presents"
-    end
-
-  end
-
-  image.gps.try do |gps|
-    puts "GPS tags are presents"
-  end
-end
-```
-
-Access a particular tag:
-
-```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg"
-orientation = tags.try &.orientation
-thumb_orientation = tags.try &.thumbnail.try &.orientation
-```
-
-Reduce parsing time / allocation amount slightly by specifying intersting tags:
-
-```cr
-filters = MakeItRight::Filters{:tags => [0x0112u16], :thumbnail => {:tags => [0x0112u16]}}
-tags = MakeItRight.from_jif "path/to/picture.jpg", filters
-```
-
-Dump all the successfully decoded tags:
-
-```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg", filters
-if tags
-  puts "All the tags:"
-  pp tags.all
+  puts "Created block will have an EXIF subifd"
+  tiff.exif = tiff.new_subifd.tap { |exif|
+    puts "Created EXIF subifd will have an interoperability subifd"
+    exif.interoperability = tiff.new_subifd(MakeItRight::Interoperability).tap { |interoperability|
+      puts "Created interoperability subifd will have an index and version"
+      interoperability.index = "R98\0".to_slice
+      interoperability.version = "0100".to_slice
+    }
+  }
 else
-  puts "no tags data found"
+  puts "Picure #{ARGV.first} contained a TIFF/EXIF block"
+  puts "Displaying all the tags found:"
+  puts "============================================"
+  pp tiff.all
+  puts "============================================"
+  puts
+  puts "Diplaying all unknown tags found:"
+  pp tiff.all_unknown_tags
+  puts
+  puts "Displaying every error encountered:"
+  pp tiff.all_errors
 end
-```
 
-Check if there were any errors while decoding any tags:
-
-```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg", filters
-if tags
-  tags.all # trigger decoding, otherwise it is lazy
-  puts "Decoding errors:"
-  pp tags.all_errors
-  # Specific ifd errors:
-  # tags.errors
-  # tags.exif.try &.errors
-  # ...
+puts
+puts "Setting the orientation tag of the picture to right-top"
+tiff.orientation = MakeItRight::Orientation::RIGHT_TOP
+tiff.gps.try do |gps|
+  puts "The picture has GPS data"
+  puts "Removing GPS data"
+  tiff.gps = nil
+  # Note that there might be other gps data elsewhere, in EXIF or somewhere else in the picture file.
 end
-```
 
-Check if there were tags unhandled (present in file but not expected, without a known name and decoding)
-
-```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg", filters
-if tags
-  puts "Unknown tags:
-  pp tags.all_unknown || "none, yay !"
-  # Specific ifd:
-  # tags.unknown_tags
-  # tags.exif.try &.unknown_tags
-  # ...
+puts
+tiff.next.try do |thumbnail|
+  puts "The picture has a thumbnail"
+  puts "Setting the orientation for the thumbnail to right-top"
+  thumbnail.orientation = MakeItRight::Orientation::RIGHT_TOP
+  # We could remove/replace the thumbnail data if we wanted to:
+  # thumbnail.payload = nil
+  # thumbnail.payload = Bytes.new size: 4
 end
-```
+puts
 
-Access the actual thumbnail raw image data
-
-```cr
-tags = MakeItRight.from_jif "path/to/picture.jpg", filters
-if tags
-  tags.thumbnail.try &.data.try do |thumbnail_picture_data|
-    puts thumbnail_picture_data.size
-  end
-end
+puts "Copying #{ARGV.first} to result.jpg with the added/edited TIFF/EXIF data block"
+MakeItRight.patch_jif tiff, ARGV.first, "result.jpg"
 ```
 
 ### TODO
 
-- [ ] Write into JPEG (parse JIF, omit existing, insert)
-- [ ] Tag write
-- [ ] Write in place into JPEG (zero previous, write over (must have enough space)
-- [ ] Remove from JPEG
+- [ ] Test run with all tags types for all alignment
+- [ ] Support write on all tag types
+- [ ] Write in place into JPEG
+- [ ] Maker Note
 - [ ] Pluto integration
-
-### TODO but probably wont do
-
-- [ ] Maker Note (im a coward)
-- [ ] Swapping endianess
-- [ ] Parse JFIF (APP0)
-- [ ] Parse XMP (APP1 but not exif)
-- [ ] Parse ICC (APPx idk)
-- [ ] Parse Photoshop metadata (APPx idk)
-- [ ] Parse from TIFF (who care)
-- [ ] Parse from PNG (barely standard)
-- [ ] Parse from HEIC (what is this)
-- [ ] Write into and pluto integration for all those file format
 
 ## Installation
 
@@ -208,21 +108,9 @@ end
 
 2. Run `shards install`
 
-## Usage
-
-```crystal
-require "make-it-right"
-```
-
-TODO: Write usage instructions here
-
-## Development
-
-TODO: Write development instructions here
-
 ## Contributing
 
-1. Fork it (<https://github.com/your-github-user/make-it-right/fork>)
+1. Fork it (<https://github.com/globoplox/make-it-right/fork>)
 2. Create your feature branch (`git checkout -b my-new-feature`)
 3. Commit your changes (`git commit -am 'Add some feature'`)
 4. Push to the branch (`git push origin my-new-feature`)
@@ -230,4 +118,4 @@ TODO: Write development instructions here
 
 ## Contributors
 
-- [Pierre Rousselle](https://github.com/your-github-user) - creator and maintainer
+- [Pierre Rousselle](https://github.com/globoplox) - creator and maintainer
