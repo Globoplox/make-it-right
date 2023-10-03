@@ -211,7 +211,11 @@ class MakeItRight::Ifd
     entry = @tags[tag]?
     return unless entry
     raise Exception.new "This tag is not registered as UInt16" unless entry[:format] == 3 && entry[:components] == 1
-    entry[:value].to_u16!
+    if @tiff.alignement == IO::ByteFormat::LittleEndian
+      entry[:value].to_u16!
+    else
+      (entry[:value] >> 16).to_u16!
+    end
   end
 
   protected def set_u16(tag : UInt16, value : UInt16?)

@@ -5,11 +5,16 @@ A pure crystal, zero dependencies EXIF parsing lib. It will be less accurate tha
 It is tested with [exiftool](https://exiftool.org/) and [exif-samples](https://github.com/ianare/exif-samples.git).
 
 It support reading and writing TIFF/EXIF data embedded into JIF (jpg) files.  
+
 It does not support maker notes. It will attempt to write back maker notes when serializing, but it:
 
 - Will NOT write maker note at the same offset that they were read from
 - Will NOT correct offset included into maker notes if the maker notes block moved
 - WIll NOT parse or write back any maker note data that are not included within the data block whose size and offset are indicated by the makre note tag.
+
+## Is it production ready ?
+
+No, there might be alignment related issues when reading/writing some tags, and absence of maker notes supports might corrupt said maker notes.
 
 ## Quick overview of EXIF
 
@@ -88,13 +93,70 @@ puts "Copying #{ARGV.first} to result.jpg with the added/edited TIFF/EXIF data b
 MakeItRight.patch_jif tiff, ARGV.first, "result.jpg"
 ```
 
+Usage with [Pluto](https://github.com/phenopolis/pluto):
+
+This example shows how to re-orient a pluto picture relative to an EXIF orientation tag.  
+This allows to ensure that an image stripped of its exif metadata will still be displayed correctly.  
+If you do not wish to strip the exif data, the prefered way should be to patch the jif as shown in the previous example.  
+Note that pluto is not listed as a dependency.
+
+```cr
+require "pluto"
+require "pluto/format/jpeg"
+require "pluto/format/png"
+require "make_it_right/pluto"
+
+module Test
+
+  file_data = File.open ARGV.first do |file|
+    file.getb_to_end
+  end
+
+  image = Pluto::ImageRGBA.from_jpeg file_data
+
+  File.open "stripped.png", "w" do |file|
+    image.to_png file
+  end
+
+
+  tiff = MakeItRight.from_jif IO::Memory.new file_data
+
+  puts "Orientation: #{tiff.try(&.orientation) || "none"}"
+
+  image = MakeItRight.straighten_pluto_picture image, tiff.try(&.orientation)
+
+  File.open "result.png", "w" do |file|
+    image.to_png file
+  end
+end
+```
+
+Alternatively, you can require a pluto plugin that will automatically correct every JPEG picture opened with pluto:
+
+```cr
+require "pluto"
+require "pluto/format/jpeg"
+require "pluto/format/png"
+require "make_it_right/pluto/plugin"
+
+module Test
+  file_data = File.open ARGV.first do |file|
+    file.getb_to_end
+  end
+
+  image = Pluto::ImageRGBA.from_jpeg file_data
+
+  File.open "result.png", "w" do |file|
+    image.to_png file
+  end
+end
+```
+
 ### TODO
 
-- [ ] Test run with all tags types for all alignment
+- [ ] Fix all tag type r/w to support both alignment
 - [ ] Support write on all tag types
-- [ ] Write in place into JPEG
 - [ ] Maker Note
-- [ ] Pluto integration
 
 ## Installation
 
