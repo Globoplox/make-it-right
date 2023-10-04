@@ -38,6 +38,7 @@ The important IFD an image can have:
 ## Usage
 
 ```cr
+require "make-it-right"
 
 puts "Opening picture #{ARGV.first}"
 tiff = MakeItRight.from_jif ARGV.first
@@ -104,7 +105,7 @@ Note that pluto is not listed as a dependency.
 require "pluto"
 require "pluto/format/jpeg"
 require "pluto/format/png"
-require "make_it_right/pluto"
+require "make-it-right/pluto"
 
 module Test
 
@@ -137,7 +138,7 @@ Alternatively, you can require a pluto plugin that will automatically correct ev
 require "pluto"
 require "pluto/format/jpeg"
 require "pluto/format/png"
-require "make_it_right/pluto/plugin"
+require "make-it-right/pluto/plugin"
 
 module Test
   file_data = File.open ARGV.first do |file|
